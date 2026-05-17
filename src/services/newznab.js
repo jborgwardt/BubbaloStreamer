@@ -1,10 +1,10 @@
 const axios = require('axios');
 const { parseStringPromise: parseXmlString } = require('xml2js');
 const { stripTrailingSlashes } = require('../utils/config');
-const { getRandomUserAgent } = require('../utils/userAgent');
+const { getDefaultSearchUserAgent, getDefaultDownloadUserAgent } = require('../utils/userAgent');
 
 const MAX_NEWZNAB_INDEXERS = 20;
-const NEWZNAB_FIELD_SUFFIXES = ['ENDPOINT', 'API_KEY', 'API_PATH', 'NAME', 'INDEXER_ENABLED', 'PAID', 'PAID_LIMIT', 'ZYCLOPS'];
+const NEWZNAB_FIELD_SUFFIXES = ['ENDPOINT', 'API_KEY', 'API_PATH', 'NAME', 'INDEXER_ENABLED', 'PAID', 'PAID_LIMIT', 'ZYCLOPS', 'SEARCH_UA', 'DOWNLOAD_UA'];
 const NEWZNAB_NUMBERED_KEYS = [];
 for (let i = 1; i <= MAX_NEWZNAB_INDEXERS; i += 1) {
   const idx = String(i).padStart(2, '0');
@@ -494,6 +494,8 @@ function buildIndexerConfig(source, idx, { includeEmpty = false } = {}) {
   const paidLimit = isPaid ? parsePaidLimit(paidLimitRaw, 6) : null;
   const zyclopsRaw = source[`NEWZNAB_ZYCLOPS_${key}`];
   const zyclopsEnabled = parseBoolean(zyclopsRaw, false);
+  const searchUserAgent = toTrimmedString(source[`NEWZNAB_SEARCH_UA_${key}`]);
+  const downloadUserAgent = toTrimmedString(source[`NEWZNAB_DOWNLOAD_UA_${key}`]);
 
   const hasAnyValue = endpoint || apiKey || apiPathRaw || name || enabledRaw !== undefined;
   if (!hasAnyValue && !includeEmpty) {
@@ -516,6 +518,8 @@ function buildIndexerConfig(source, idx, { includeEmpty = false } = {}) {
     isPaid,
     paidLimit,
     zyclopsEnabled,
+    searchUserAgent,
+    downloadUserAgent,
     slug,
     dedupeKey: slug || `indexer-${key}`,
     baseUrl: normalizedEndpoint ? `${normalizedEndpoint}${apiPath}` : '',
@@ -550,6 +554,32 @@ function filterUsableConfigs(configs = [], { requireEnabled = true, requireApiKe
     if (requireApiKey && !config.apiKey) return false;
     return true;
   });
+}
+
+/**
+ * Resolve the configured download User-Agent for a given indexer identifier.
+ * The identifier can be a slug/dedupeKey (preferred) or a display name. If no
+ * matching indexer is found or it has no override, returns the global default.
+ */
+function getDownloadUserAgentForIndexer(identifier) {
+  const fallback = getDefaultDownloadUserAgent();
+  if (!identifier) return fallback;
+  const target = String(identifier).trim().toLowerCase();
+  if (!target) return fallback;
+  try {
+    const configs = buildIndexerConfigs(process.env, { includeEmpty: false });
+    for (const config of configs) {
+      const candidates = [config.dedupeKey, config.slug, config.displayName, config.name]
+        .filter(Boolean)
+        .map((value) => String(value).toLowerCase());
+      if (candidates.includes(target) && config.downloadUserAgent) {
+        return config.downloadUserAgent;
+      }
+    }
+  } catch (_) {
+    // ignore — fall back to default
+  }
+  return fallback;
 }
 
 // Seed default caps for any enabled indexer that has no cached caps
@@ -837,7 +867,7 @@ async function fetchIndexerResults(config, plan, options) {
     timeout: options.timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS,
     responseType: 'text',
     headers: {
-      'User-Agent': getRandomUserAgent(),
+      'User-Agent': config.searchUserAgent || getDefaultSearchUserAgent(),
     },
     validateStatus: () => true,
   });
@@ -1060,6 +1090,7 @@ module.exports = {
   getEnvNewznabConfigs,
   getNewznabConfigsFromValues,
   filterUsableConfigs,
+  getDownloadUserAgentForIndexer,
   searchNewznabIndexers,
   testNewznabCaps,
   validateNewznabSearch,

@@ -11,7 +11,8 @@ const cache = require('../cache');
 const diskNzbCache = require('../cache/diskNzbCache');
 const { normalizeReleaseTitle, normalizeNzbdavPath, isVideoFileName, fileMatchesEpisode, inferMimeType } = require('../utils/parsers');
 const { sleep, safeStat } = require('../utils/helpers');
-const { getRandomUserAgent } = require('../utils/userAgent');
+const { getDefaultDownloadUserAgent } = require('../utils/userAgent');
+const { getDownloadUserAgentForIndexer } = require('./newznab');
 
 const pipelineAsync = promisify(pipeline);
 
@@ -158,7 +159,7 @@ function extractNzbdavQueueId(payload) {
     || null;
 }
 
-async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLabel }) {
+async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLabel, indexerId = null }) {
   ensureNzbdavConfigured();
 
   if (!category) {
@@ -229,10 +230,11 @@ async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLa
   // then upload via addfile. This avoids NZBDav fetching the URL with its own UA.
   console.log(`[NZBDAV] Downloading NZB for addfile upload (${jobLabelDisplay})`);
   try {
+    const downloadUa = (indexerId && getDownloadUserAgentForIndexer(indexerId)) || getDefaultDownloadUserAgent();
     const dlResponse = await axios.get(downloadUrl, {
       responseType: 'arraybuffer',
       timeout: 30000,
-      headers: { 'User-Agent': getRandomUserAgent() },
+      headers: { 'User-Agent': downloadUa },
       validateStatus: (status) => status < 500,
     });
 
@@ -578,7 +580,7 @@ async function findBestVideoFile({ category, jobName, requestedEpisode }) {
   return bestEpisodeMatch || bestMatch;
 }
 
-async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisode, existingSlot = null, inlineCachedEntry = null }) {
+async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisode, existingSlot = null, inlineCachedEntry = null, indexerId = null }) {
   let reuseError = null;
   const attempts = [];
   if (existingSlot?.nzoId) {
@@ -610,6 +612,7 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
           cachedEntry: cachedNzbEntry,
           category,
           jobLabel: title,
+          indexerId,
         });
         nzoId = added.nzoId;
         slot = await waitForNzbdavHistorySlot(nzoId, category);

@@ -1,6 +1,7 @@
 const axios = require('axios');
 const { triageNzbs } = require('./index');
-const { getRandomUserAgent } = require('../../utils/userAgent');
+const { getDefaultDownloadUserAgent } = require('../../utils/userAgent');
+const { getDownloadUserAgentForIndexer } = require('../newznab');
 
 const DEFAULT_TIME_BUDGET_MS = 40000;
 const DEFAULT_MAX_CANDIDATES = 25;
@@ -330,13 +331,15 @@ async function triageAndRank(nzbResults, options = {}) {
             abortController.abort();
           }, downloadTimeoutMs);
 
+          const downloadUa = getDownloadUserAgentForIndexer(candidate.indexerId || candidate.indexerName)
+            || getDefaultDownloadUserAgent();
           const response = await axios.get(downloadUrl, {
             responseType: 'text',
             timeout: downloadTimeoutMs,
             signal: abortController.signal,
             headers: {
               Accept: 'application/x-nzb,text/xml;q=0.9,*/*;q=0.8',
-              'User-Agent': getRandomUserAgent(),
+              'User-Agent': downloadUa,
             },
             transitional: { silentJSONParsing: true, forcedJSONParsing: false },
           }).finally(() => {

@@ -2949,6 +2949,7 @@ async function streamHandler(req, res) {
               title: candidate.title,
               category: categoryForType,
               requestedEpisode,
+              indexerId: candidate.indexerId || candidate.indexer || null,
             };
           }
         }
@@ -2973,6 +2974,7 @@ async function streamHandler(req, res) {
               title: candidate.title,
               category: categoryForType,
               requestedEpisode,
+              indexerId: candidate.indexerId || candidate.indexer || null,
             };
           }
         }
@@ -2997,6 +2999,7 @@ async function streamHandler(req, res) {
               title: candidate.title,
               category: categoryForType,
               requestedEpisode,
+              indexerId: candidate.indexerId || candidate.indexer || null,
             };
             break;
           }
@@ -3724,6 +3727,7 @@ async function streamHandler(req, res) {
                 requestedEpisode,
                 existingSlot,
                 inlineCachedEntry: cachedEntry,
+                indexerId: candidate.indexerId || candidate.indexer || null,
               });
             });
           };
@@ -3856,6 +3860,7 @@ async function streamHandler(req, res) {
               requestedEpisode,
               existingSlot,
               inlineCachedEntry: cachedEntry,
+              indexerId: candidate.indexerId || candidate.indexer || null,
             });
           });
         };
@@ -3878,6 +3883,7 @@ async function streamHandler(req, res) {
           title: finalNzbResults[0].title,
           category: categoryForType,
           requestedEpisode,
+          indexerId: finalNzbResults[0].indexerId || finalNzbResults[0].indexer || null,
         };
       }
     }
@@ -3909,6 +3915,7 @@ async function streamHandler(req, res) {
                 cachedEntry,
                 category: prefetchCandidate.category,
                 jobLabel: prefetchCandidate.title,
+                indexerId: prefetchCandidate.indexerId || null,
               });
               resolve({
                 nzoId: added.nzoId,

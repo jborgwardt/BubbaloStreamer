@@ -48,7 +48,7 @@
   let loadedSortMode = 'quality_then_size';
 
   const MAX_NEWZNAB_INDEXERS = 20;
-  const NEWZNAB_SUFFIXES = ['ENDPOINT', 'API_KEY', 'API_PATH', 'NAME', 'INDEXER_ENABLED', 'PAID', 'PAID_LIMIT', 'ZYCLOPS'];
+  const NEWZNAB_SUFFIXES = ['ENDPOINT', 'API_KEY', 'API_PATH', 'NAME', 'INDEXER_ENABLED', 'PAID', 'PAID_LIMIT', 'ZYCLOPS', 'SEARCH_UA', 'DOWNLOAD_UA'];
   const SUPPORTED_SORT_KEYS = ['language', 'release_group', 'size', 'resolution', 'quality', 'encode', 'visual_tag', 'audio_tag', 'keyword', 'date', 'files'];
   const SORT_LABELS = {
     language: 'Language',
@@ -515,10 +515,6 @@
               <option value="6" selected>6</option>
             </select>
           </label>
-          <label class="checkbox">
-            <input type="checkbox" data-field="ZYCLOPS" />
-            <span>Enable Zyclops Health Check Proxy</span>
-          </label>
         </div>
         <button type="button" class="row-remove" data-row-action="remove" title="Remove indexer" aria-label="Remove indexer">&#128465;</button>
       </div>
@@ -548,7 +544,24 @@
         <button type="button" class="secondary" data-row-action="test">Test Indexer</button>
         <span class="status-message row-status" data-row-status></span>
       </div>
-      <p class="warning hidden" data-zyclops-warning>⚠️ Zyclops proxies your indexer URL/API key and returns only known-healthy results for your providers. It also downloads and ingests the newest untested NZB to enrich the health database. (Learn more <A HREF="https://zyclops.elfhosted.com/">here</A>) Many indexers prohibit this, so proceed at your own risk. The health database is directly searchable via Newznab on private ElfHosted instances only.</p>
+      <details class="advanced-settings">
+        <summary>Advanced settings</summary>
+        <div class="field-grid">
+          <label>Search User-Agent
+            <input type="text" data-field="SEARCH_UA" placeholder="Prowlarr/2.0.5" />
+            <span class="field-hint">User-Agent sent on Newznab API search calls. Leave blank to use the default.</span>
+          </label>
+          <label>Download User-Agent
+            <input type="text" data-field="DOWNLOAD_UA" placeholder="SABnzbd/4.5.5" />
+            <span class="field-hint">User-Agent sent when downloading the NZB file (used by health checks and NZBDav uploads). Leave blank to use the default.</span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" data-field="ZYCLOPS" />
+            <span>Enable Zyclops Health Check Proxy</span>
+          </label>
+        </div>
+        <p class="warning hidden" data-zyclops-warning>⚠️ Zyclops proxies your indexer URL/API key and returns only known-healthy results for your providers. It also downloads and ingests the newest untested NZB to enrich the health database. (Learn more <A HREF="https://zyclops.elfhosted.com/">here</A>) Many indexers prohibit this, so proceed at your own risk. The health database is directly searchable via Newznab on private ElfHosted instances only.</p>
+      </details>
     `;
 
     const removeButton = row.querySelector('[data-row-action="remove"]');
@@ -599,6 +612,16 @@
     const zyclopsCheck = row.querySelector('[data-field="ZYCLOPS"]');
     const zyclopsWarn = row.querySelector('[data-zyclops-warning]');
     if (zyclopsCheck && zyclopsWarn) zyclopsWarn.classList.toggle('hidden', !zyclopsCheck.checked);
+    // Auto-open Advanced settings if Zyclops is enabled or any UA override is set
+    const advancedDetails = row.querySelector('details.advanced-settings');
+    if (advancedDetails) {
+      const searchUaInput = row.querySelector('[data-field="SEARCH_UA"]');
+      const downloadUaInput = row.querySelector('[data-field="DOWNLOAD_UA"]');
+      const hasOverride = (searchUaInput && searchUaInput.value && searchUaInput.value.trim())
+        || (downloadUaInput && downloadUaInput.value && downloadUaInput.value.trim())
+        || (zyclopsCheck && zyclopsCheck.checked);
+      if (hasOverride) advancedDetails.open = true;
+    }
     if (options.preset) {
       setRowApiKeyLink(row, options.preset);
     } else {
