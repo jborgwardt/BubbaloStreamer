@@ -872,12 +872,13 @@
       allowNewznabTestSearch = Boolean(data?.debugNewznabSearch);
       setupNewznabRowsFromValues(values);
       populateForm(values);
-      // Backward compat: derive NZB_STREAM_PROTECTION from legacy vars if not set
+      // Backward compat: derive NZB_STREAM_PROTECTION from legacy vars if not set.
+      // Triage disabled (or unset) → auto-advance (no health checks, runtime failover).
       if (streamProtectionSelect && !values.NZB_STREAM_PROTECTION) {
         const legacyEnabled = parseBool(values.NZB_TRIAGE_ENABLED);
         const legacyMode = (values.NZB_TRIAGE_MODE || '').trim().toLowerCase();
         if (!legacyEnabled) {
-          streamProtectionSelect.value = 'none';
+          streamProtectionSelect.value = 'auto-advance';
         } else if (legacyMode === 'background') {
           streamProtectionSelect.value = 'smart-play';
         } else {

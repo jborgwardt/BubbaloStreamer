@@ -607,14 +607,15 @@ function deriveStreamProtection() {
       // Prefetch is user-controlled — not forced for smart-play modes
       break;
     default:
-      // Backward compat: derive from legacy NZB_TRIAGE_ENABLED / NZB_TRIAGE_MODE
+      // Backward compat: derive from legacy NZB_TRIAGE_ENABLED / NZB_TRIAGE_MODE.
+      // Triage disabled (or unset) → auto-advance (no health checks, runtime failover).
       TRIAGE_ENABLED = toBoolean(process.env.NZB_TRIAGE_ENABLED, false);
-      const rawMode = (process.env.NZB_TRIAGE_MODE || '').trim().toLowerCase();
-      if (['blocking', 'background', 'disabled'].includes(rawMode)) {
-        TRIAGE_MODE = rawMode;
-      } else {
-        TRIAGE_MODE = TRIAGE_ENABLED ? 'blocking' : 'disabled';
+      if (!TRIAGE_ENABLED) {
+        TRIAGE_MODE = 'disabled'; AUTO_ADVANCE_ENABLED = true;
+        break;
       }
+      const rawMode = (process.env.NZB_TRIAGE_MODE || '').trim().toLowerCase();
+      TRIAGE_MODE = ['blocking', 'background', 'disabled'].includes(rawMode) ? rawMode : 'blocking';
       AUTO_ADVANCE_ENABLED = TRIAGE_MODE === 'background';
       break;
   }
