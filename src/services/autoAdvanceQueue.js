@@ -22,7 +22,21 @@ const EventEmitter = require('events');
 
 const POLL_INTERVAL_MS = 200;
 const DEFAULT_READY_TIMEOUT_MS = 240000;
-const SESSION_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
+// Failover sessions are kept as long as the streams they point at stay valid.
+// Default 30 days (env AUTO_ADVANCE_SESSION_TTL_MINUTES); aligned with the
+// stream/NZBDav/disk caches so a session never outlives its backing data.
+const SESSION_TTL_MS = (() => {
+  const raw = Number(process.env.AUTO_ADVANCE_SESSION_TTL_MINUTES);
+  if (Number.isFinite(raw) && raw > 0) return raw * 60 * 1000;
+  return 30 * 24 * 60 * 60 * 1000; // 30 days
+})();
+// Hard cap on concurrent sessions so the in-memory map can't grow unbounded
+// between prunes (each session is small, but there was previously no limit).
+const MAX_SESSIONS = (() => {
+  const raw = Number(process.env.AUTO_ADVANCE_MAX_SESSIONS);
+  if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+  return 500;
+})();
 const DEFAULT_MAX_ATTEMPTS = 12;
 
 // Active sessions keyed by contentKey (e.g., "movie:tt1234567" or "series:tt1234567:1:1")
@@ -62,6 +76,7 @@ class AutoAdvanceSession extends EventEmitter {
     this.createdAt = Date.now();
     this.activated = false;       // nothing queued until activated
     this.attemptedCount = 0;      // how many candidates have been queued for NZBDav processing
+    this.activeWaiters = 0;       // in-flight waitForReady() calls — never evict while > 0
   }
 
   get activeCount() {
@@ -74,36 +89,43 @@ class AutoAdvanceSession extends EventEmitter {
    * Rejects if timeout reached or all candidates exhausted.
    */
   async waitForReady(timeoutMs = DEFAULT_READY_TIMEOUT_MS) {
-    // Activate on first user interaction
-    if (!this.activated) {
-      this.activated = true;
-      this._fillPipeline();
-    }
-
-    const deadline = Date.now() + timeoutMs;
-
-    while (Date.now() < deadline && !this.closed) {
-      const slot = this._getFirstReadySlot();
-      if (slot) return slot;
-
-      // Check if all candidates are exhausted
-      if (this._allExhausted()) {
-        throw new Error('All NZB candidates exhausted — no more auto-advance options available');
+    // Mark in-use so the session-cap janitor won't evict this session out from
+    // under an active stream. Decremented in finally on every exit path.
+    this.activeWaiters += 1;
+    try {
+      // Activate on first user interaction
+      if (!this.activated) {
+        this.activated = true;
+        this._fillPipeline();
       }
 
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, POLL_INTERVAL_MS);
-        const onReady = () => { clearTimeout(timer); resolve(); };
-        this.once('slot-ready', onReady);
-        // Also resolve on timeout to re-check
-        setTimeout(() => { this.removeListener('slot-ready', onReady); }, POLL_INTERVAL_MS);
-      });
-    }
+      const deadline = Date.now() + timeoutMs;
 
-    if (this.closed) {
-      throw new Error('Auto-Advance session closed');
+      while (Date.now() < deadline && !this.closed) {
+        const slot = this._getFirstReadySlot();
+        if (slot) return slot;
+
+        // Check if all candidates are exhausted
+        if (this._allExhausted()) {
+          throw new Error('All NZB candidates exhausted — no more auto-advance options available');
+        }
+
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, POLL_INTERVAL_MS);
+          const onReady = () => { clearTimeout(timer); resolve(); };
+          this.once('slot-ready', onReady);
+          // Also resolve on timeout to re-check
+          setTimeout(() => { this.removeListener('slot-ready', onReady); }, POLL_INTERVAL_MS);
+        });
+      }
+
+      if (this.closed) {
+        throw new Error('Auto-Advance session closed');
+      }
+      throw new Error('Timed out waiting for a ready NZB');
+    } finally {
+      this.activeWaiters -= 1;
     }
-    throw new Error('Timed out waiting for a ready NZB');
   }
 
   /**
@@ -328,6 +350,8 @@ function createSession(contentKey, candidates, options = {}) {
   }
   const session = new AutoAdvanceSession(contentKey, candidates, options);
   activeSessions.set(contentKey, session);
+  // TTL + cap are enforced by the server's periodic janitor (pruneExpiredSessions),
+  // not on the hot create path — and never against a session that is in use.
   return session;
 }
 
@@ -353,9 +377,26 @@ function closeSession(contentKey) {
 function pruneExpiredSessions() {
   const now = Date.now();
   for (const [key, session] of activeSessions) {
-    if (session.closed || (now - session.createdAt > SESSION_TTL_MS)) {
+    if (session.closed) {
+      activeSessions.delete(key);
+    } else if ((now - session.createdAt > SESSION_TTL_MS) && session.activeWaiters === 0) {
       session.close();
       activeSessions.delete(key);
+    }
+  }
+  // Enforce the concurrent-session cap — close oldest (by createdAt) first, but
+  // NEVER a session with an in-flight waitForReady() (that would 502 an active
+  // stream). Sessions in use are skipped and reclaimed on a later pass.
+  if (MAX_SESSIONS > 0 && activeSessions.size > MAX_SESSIONS) {
+    const oldest = Array.from(activeSessions.entries())
+      .sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
+    let overBy = activeSessions.size - MAX_SESSIONS;
+    for (const [key, session] of oldest) {
+      if (overBy <= 0) break;
+      if (session.activeWaiters > 0) continue; // in use — don't evict
+      session.close();
+      activeSessions.delete(key);
+      overBy -= 1;
     }
   }
 }

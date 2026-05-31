@@ -11,6 +11,24 @@ function clearAllCaches(reason = 'manual') {
   diskNzbCache.clearDiskCache(reason);
 }
 
+// Clear only the in-memory (transient) caches. Used on config save: a settings
+// change can invalidate resolved results and NZBDav mount pointers, but NOT the
+// on-disk NZB payloads — those are keyed by download URL and stay valid across
+// settings changes, so we keep them for fast re-mounts (no needless re-downloads).
+function clearTransientCaches(reason = 'manual') {
+  streamCache.clearStreamResponseCache(reason);
+  nzbCache.clearVerifiedNzbCache(reason);
+  nzbdavCache.clearNzbdavStreamCache(reason);
+}
+
+// Periodic maintenance: enforce TTL + size/count caps across the caches.
+// Called by the server's janitor timer so nothing relies on an admin save.
+function runMaintenance() {
+  streamCache.cleanupStreamCache();
+  nzbdavCache.cleanupNzbdavCache();
+  diskNzbCache.runMaintenance();
+}
+
 function getAllCacheStats() {
   return {
     stream: streamCache.getStreamCacheStats(),
@@ -35,5 +53,7 @@ module.exports = {
   
   // Combined operations
   clearAllCaches,
+  clearTransientCaches,
+  runMaintenance,
   getAllCacheStats,
 };

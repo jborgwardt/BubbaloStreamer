@@ -85,6 +85,20 @@ const autoAdvanceQueue = require('./src/services/autoAdvanceQueue');
 const backgroundTriage = require('./src/services/backgroundTriage');
 const diskNzbCache = require('./src/cache/diskNzbCache');
 
+// Periodic janitor — prune caches + sessions on a timer so RAM/disk stay
+// bounded without relying on an admin config-save. unref() so it never keeps
+// the process alive on its own. Runs once for the process lifetime.
+const CACHE_JANITOR_INTERVAL_MS = (() => {
+  const raw = Number(process.env.CACHE_JANITOR_INTERVAL_MINUTES);
+  if (Number.isFinite(raw) && raw > 0) return raw * 60 * 1000;
+  return 10 * 60 * 1000; // 10 minutes
+})();
+setInterval(() => {
+  try { cache.runMaintenance(); } catch (err) { console.warn('[JANITOR] cache maintenance failed:', err.message); }
+  try { autoAdvanceQueue.pruneExpiredSessions(); } catch (err) { console.warn('[JANITOR] auto-advance prune failed:', err.message); }
+  try { backgroundTriage.pruneSessions(); } catch (err) { console.warn('[JANITOR] bg-triage prune failed:', err.message); }
+}, CACHE_JANITOR_INTERVAL_MS).unref();
+
 const app = express();
 let currentPort = Number(process.env.PORT || 7000);
 const ADDON_VERSION = '1.7.12';
@@ -239,6 +253,43 @@ adminApiRouter.post('/config', async (req, res) => {
     return;
   }
 
+  // Validate user-facing numeric fields server-side. The admin form is
+  // `novalidate`, so its min/max attributes aren't enforced — reject an
+  // out-of-range value with a clear message instead of silently persisting
+  // something that disables a feature or breaks triage. Empty = "use default".
+  const NUMERIC_FIELD_RULES = {
+    NZB_RESOLUTION_LIMIT_PER_QUALITY: { min: 0, integer: true, label: 'Results per quality' },
+    NZB_MIN_RESULT_SIZE_GB: { min: 0, label: 'Min result size (GB)' },
+    NZB_MAX_RESULT_SIZE_GB: { min: 0, label: 'Max result size (GB)' },
+    NZB_MAX_BITRATE_MBPS: { min: 0, label: 'Max bitrate (Mbps)' },
+    NZBDAV_HISTORY_CATALOG_LIMIT: { min: 0, max: 200, integer: true, label: 'Stremio catalog limit' },
+    NZB_TRIAGE_NNTP_PORT: { min: 1, max: 65535, integer: true, label: 'NNTP port' },
+    NZB_TRIAGE_MAX_CONNECTIONS: { min: 2, max: 12, integer: true, label: 'Max NNTP connections' },
+  };
+  for (const [key, rule] of Object.entries(NUMERIC_FIELD_RULES)) {
+    if (!Object.prototype.hasOwnProperty.call(incoming, key)) continue;
+    const raw = incoming[key];
+    if (raw === '' || raw === null || raw === undefined) continue; // unset = use default
+    const num = Number(raw);
+    const rangeText = rule.max !== undefined ? `between ${rule.min} and ${rule.max}` : `${rule.min} or greater`;
+    if (!Number.isFinite(num)
+        || (rule.integer && !Number.isInteger(num))
+        || num < rule.min
+        || (rule.max !== undefined && num > rule.max)) {
+      res.status(400).json({ error: `${rule.label} must be ${rule.integer ? 'a whole number ' : ''}${rangeText} (got "${raw}").` });
+      return;
+    }
+  }
+  // Cross-field: min result size must not exceed max result size.
+  if (incoming.NZB_MIN_RESULT_SIZE_GB && incoming.NZB_MAX_RESULT_SIZE_GB) {
+    const mn = Number(incoming.NZB_MIN_RESULT_SIZE_GB);
+    const mx = Number(incoming.NZB_MAX_RESULT_SIZE_GB);
+    if (Number.isFinite(mn) && Number.isFinite(mx) && mn > mx) {
+      res.status(400).json({ error: `Min result size (${mn} GB) can't be larger than max result size (${mx} GB).` });
+      return;
+    }
+  }
+
   // Debug: log TMDb related keys
   console.log('[ADMIN] Received TMDb config:', {
     TMDB_ENABLED: incoming.TMDB_ENABLED,
@@ -356,7 +407,10 @@ adminApiRouter.post('/config', async (req, res) => {
     if (typeof cache.reloadNzbdavCacheConfig === 'function') {
       cache.reloadNzbdavCacheConfig();
     }
-    cache.clearAllCaches('admin-config-save');
+    // Clear in-memory caches + sessions (they hold config-dependent state), but
+    // KEEP the on-disk NZB payloads — they stay valid across settings changes and
+    // give fast re-mounts without re-downloading from indexers.
+    cache.clearTransientCaches('admin-config-save');
     backgroundTriage.closeAllSessions('admin-config-save');
     autoAdvanceQueue.closeAllSessions('admin-config-save');
     const { portChanged } = rebuildRuntimeConfig();
@@ -685,6 +739,9 @@ let sharedPoolMonitorTimer = null;
 // Avoids re-downloading NZBs on the second request when triage timed out.
 // Entries auto-expire after 10 minutes.
 const UPFRONT_PAYLOAD_CACHE_TTL_MS = 10 * 60 * 1000;
+// Cap entries so a burst of triage downloads can't balloon RAM with raw NZB
+// bytes (each entry is a full NZB payload). Oldest-inserted evicted first.
+const UPFRONT_PAYLOAD_CACHE_MAX = 40;
 const upfrontNzbPayloadCache = new Map();
 function getOrPruneUpfrontPayloadCache() {
   const now = Date.now();
@@ -706,6 +763,11 @@ function getOrPruneUpfrontPayloadCache() {
     },
     set(url, payload) {
       upfrontNzbPayloadCache.set(url, { payload, ts: Date.now() });
+      while (upfrontNzbPayloadCache.size > UPFRONT_PAYLOAD_CACHE_MAX) {
+        const oldestKey = upfrontNzbPayloadCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        upfrontNzbPayloadCache.delete(oldestKey);
+      }
     },
     has(url) {
       return this.get(url) !== undefined;

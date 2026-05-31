@@ -4,6 +4,7 @@ const { getDefaultDownloadUserAgent } = require('../../utils/userAgent');
 const { getDownloadUserAgentForIndexer, getProxyForIndexer } = require('../newznab');
 const { getManagerProxy } = require('../indexer');
 const { proxiedGet } = require('../../utils/proxyAgent');
+const diskNzbCache = require('../../cache/diskNzbCache');
 
 const DEFAULT_TIME_BUDGET_MS = 40000;
 const DEFAULT_MAX_CANDIDATES = 25;
@@ -315,11 +316,35 @@ async function triageAndRank(nzbResults, options = {}) {
 
       let nzbPayload;
 
-      // Check payload cache first — avoids re-downloading on retries
+      // 1. In-session RAM cache — avoids re-downloading on retries this pass.
       const cachedPayload = nzbPayloadCache ? nzbPayloadCache.get(downloadUrl) : null;
+      // 2. On-disk verified-payload cache — a previously-verified NZB is already
+      //    saved to disk, so reuse it and skip the indexer re-download (saves
+      //    indexer / Cloudflare-WAF hits). The NNTP health check still runs on it
+      //    below, so freshness of article availability is unaffected.
+      let diskPayload = null;
+      if (!cachedPayload) {
+        try {
+          const diskEntry = diskNzbCache.getFromDisk(downloadUrl);
+          if (diskEntry && diskEntry.payloadBuffer) {
+            diskPayload = diskEntry.payloadBuffer.toString('utf8');
+          }
+        } catch { /* ignore — fall through to a normal download */ }
+      }
       if (cachedPayload) {
         nzbPayload = cachedPayload;
         logEvent(logger, 'info', 'NZB download:cache-hit', {
+          downloadUrl,
+          indexerId: candidate.indexerId,
+          indexerName: candidate.indexerName,
+          title: candidate.title,
+          bytes: typeof nzbPayload === 'string' ? nzbPayload.length : null,
+        });
+      } else if (diskPayload) {
+        nzbPayload = diskPayload;
+        // Keep it in the RAM cache so retries this pass don't re-read disk.
+        if (nzbPayloadCache) nzbPayloadCache.set(downloadUrl, nzbPayload);
+        logEvent(logger, 'info', 'NZB download:disk-hit', {
           downloadUrl,
           indexerId: candidate.indexerId,
           indexerName: candidate.indexerName,

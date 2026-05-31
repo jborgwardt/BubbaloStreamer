@@ -15,6 +15,21 @@ const TRIAGE_BATCH_DELAY_MS = 500;
 const DEFAULT_MAX_EVALUATE = 12;
 const MAX_CONSECUTIVE_FAILED_BATCHES = 3; // bail if N batches in a row produce 0 health checks
 
+// Session retention: keep the (light, post-triage) session records around for
+// a while so re-requests reuse decisions, but bound them by TTL + count so the
+// map can't accumulate forever. Heavy NZB payload bytes are already freed when
+// triage completes (nzbPayloadCache.clear()).
+const SESSION_TTL_MS = (() => {
+  const raw = Number(process.env.BG_TRIAGE_SESSION_TTL_MINUTES);
+  if (Number.isFinite(raw) && raw > 0) return raw * 60 * 1000;
+  return 30 * 24 * 60 * 60 * 1000; // 30 days
+})();
+const MAX_SESSIONS = (() => {
+  const raw = Number(process.env.BG_TRIAGE_MAX_SESSIONS);
+  if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+  return 500;
+})();
+
 // Transient statuses that can be retried in a later batch
 const TRANSIENT_STATUSES = new Set(['error', 'fetch-error', 'pending', 'unverified']);
 // Permanent statuses that should never be retried
@@ -47,12 +62,16 @@ function start(contentKey, candidates, triageOptions, nzbdavOptions = {}) {
   const session = new BackgroundTriageSession(contentKey, candidates, triageOptions, nzbdavOptions);
   backgroundSessions.set(contentKey, session);
   session.runPromise = session.run(); // fire and forget, but promise available for callers
+  // TTL + cap are enforced by the server's periodic janitor (pruneSessions), not
+  // on the hot start path — and never against a session that is in use.
   return session;
 }
 
 function getSession(contentKey) {
   const session = backgroundSessions.get(contentKey);
   if (!session) return null;
+  // TTL is enforced only by the periodic janitor (pruneSessions), not here, so
+  // a concurrent getSession() can never close a session another request holds.
   if (session.closed) {
     backgroundSessions.delete(contentKey);
     return null;
@@ -65,6 +84,34 @@ function closeSession(contentKey) {
   if (session) {
     session.close();
     backgroundSessions.delete(contentKey);
+  }
+}
+
+// Prune closed/expired sessions and enforce the concurrent-session cap.
+// Safe to call periodically (server janitor) and on session creation.
+function pruneSessions() {
+  const now = Date.now();
+  for (const [key, session] of backgroundSessions) {
+    if (session.closed) {
+      backgroundSessions.delete(key);
+    } else if ((now - session.createdAt > SESSION_TTL_MS) && session.activeWaiters === 0) {
+      session.close();
+      backgroundSessions.delete(key);
+    }
+  }
+  // Cap eviction — oldest first, but never a session with an in-flight
+  // waitForReady() (would break an active stream); skipped ones reclaim later.
+  if (MAX_SESSIONS > 0 && backgroundSessions.size > MAX_SESSIONS) {
+    const oldest = Array.from(backgroundSessions.entries())
+      .sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
+    let overBy = backgroundSessions.size - MAX_SESSIONS;
+    for (const [key, session] of oldest) {
+      if (overBy <= 0) break;
+      if (session.activeWaiters > 0) continue; // in use — don't evict
+      session.close();
+      backgroundSessions.delete(key);
+      overBy -= 1;
+    }
   }
 }
 
@@ -92,6 +139,7 @@ class BackgroundTriageSession {
     this.selectionReady = false; // Set after first pass (before retries) when verified NZBs are available for top-ranked selection
     this.createdAt = Date.now();
     this.triageElapsedMs = 0;
+    this.activeWaiters = 0;    // in-flight waitForReady() calls — never evict while > 0
 
     // Stats
     this.evaluated = 0;        // total decisions received (including fetch-errors)
@@ -128,6 +176,11 @@ class BackgroundTriageSession {
     const deadline = Date.now() + timeoutMs;
     const smartPlayMode = this.nzbdavOptions.smartPlayMode || 'fastest';
 
+    // Mark in-use so the session-cap janitor won't evict this session (or its
+    // nested auto-advance session) mid-wait. `return await` below keeps the
+    // counter held for the full delegated wait; finally decrements on all exits.
+    this.activeWaiters += 1;
+    try {
     // Wait for auto-advance session to exist
     while (!this.autoAdvanceSession && !this.closed && Date.now() < deadline) {
       // If triage is done and nothing was verified, fail immediately
@@ -166,7 +219,12 @@ class BackgroundTriageSession {
       throw new Error('Timed out waiting for a ready NZB');
     }
 
-    return this.autoAdvanceSession.waitForReady(remaining);
+    // `return await` (not bare return) so the in-use counter stays held until
+    // the delegated wait actually resolves/rejects.
+    return await this.autoAdvanceSession.waitForReady(remaining);
+    } finally {
+      this.activeWaiters -= 1;
+    }
   }
 
   /**
@@ -357,6 +415,7 @@ class BackgroundTriageSession {
 
   close() {
     this.closed = true;
+    this.nzbPayloadCache.clear();
     if (this.autoAdvanceSession) {
       this.autoAdvanceSession.close();
     }
@@ -500,6 +559,11 @@ class BackgroundTriageSession {
 
     this.triageComplete = true;
     this.triageElapsedMs = Date.now() - startTs;
+    // Free the per-session NZB payload retry cache now that triage is done.
+    // Verified payloads are already persisted to disk (onDecision -> cacheToDisk)
+    // and the grab path reads from disk, so holding these raw NZB bytes in RAM
+    // for the rest of the session's life is pure waste.
+    this.nzbPayloadCache.clear();
 
     console.log(`[BG-TRIAGE] Complete for ${this.contentKey}: ${this.verifiedUrls.length} verified, ${this.blockedUrls.size} blocked, ${this.healthChecked} health-checked, ${this.evaluated} total in ${this.triageElapsedMs}ms`);
 
@@ -663,5 +727,6 @@ module.exports = {
   getSession,
   closeSession,
   closeAllSessions,
+  pruneSessions,
   BackgroundTriageSession,
 };

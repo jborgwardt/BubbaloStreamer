@@ -6,13 +6,18 @@ let streamCacheBytes = 0;
 const STREAM_CACHE_TTL_MS = (() => {
   const raw = Number(process.env.STREAM_CACHE_TTL_MINUTES);
   if (Number.isFinite(raw) && raw >= 0) return raw * 60 * 1000;
-    return 72 * 60 * 60 * 1000; // Default 72 hours
+  // 72h: search results go stale (new releases, rotated links), so once they
+  // age out a fresh search re-runs rather than serving very old results.
+  return 72 * 60 * 60 * 1000;
 })();
 
+// Keep RAM minimal — this is an in-memory cache, so the byte cap is the RAM
+// ceiling. Default 32MB (env STREAM_CACHE_MAX_SIZE_MB). Entries are small
+// (a few KB–hundreds of KB), so this still holds plenty of recent results.
 const STREAM_CACHE_MAX_BYTES = (() => {
   const raw = Number(process.env.STREAM_CACHE_MAX_SIZE_MB);
   if (Number.isFinite(raw) && raw > 0) return raw * 1024 * 1024;
-  return 200 * 1024 * 1024; // Default 200MB
+  return 32 * 1024 * 1024; // Default 32MB
 })();
 
 const STREAM_CACHE_MAX_ENTRIES = 1000;
