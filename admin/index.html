@@ -68,21 +68,20 @@
               </select>
             </label>
             <label data-manager-field>Manager URL
-              <input name="INDEXER_MANAGER_URL" type="url" placeholder="http://localhost:9696 or http://prowlarr:9696" />
-              <span class="field-hint">In Docker, use the service/container name instead of localhost — e.g. http://prowlarr:9696 (Prowlarr) or http://nzbhydra:5076 (NZBHydra). localhost only works if the manager runs in the same container as the addon.</span>
+              <input name="INDEXER_MANAGER_URL" type="url" placeholder="http://your-lan-ip:9696 or http://prowlarr:9696" />
             </label>
             <label data-manager-field>API Key
               <input name="INDEXER_MANAGER_API_KEY" type="password" autocomplete="new-password" />
             </label>
-            <label data-manager-field>Indexer IDs / Names
+            <label data-manager-field class="align-2line">Indexer IDs / Names
               <input name="INDEXER_MANAGER_INDEXERS" type="text" placeholder="-1 or sci-fi,4k" />
               <span class="field-hint">Comma-separated list of indexers this addon may query. Prowlarr: numeric IDs, with -1 meaning “all Usenet indexers”. NZBHydra: type the indexer names exactly as shown in Hydra.</span>
             </label>
-            <label data-manager-field>I have paid subscriptions with (comma separated)
+            <label data-manager-field class="align-2line">I have paid subscriptions with (comma separated)
               <input name="NZB_TRIAGE_PRIORITY_INDEXERS" type="text" placeholder="9,33" />
               <span class="field-hint">Comma-separated IDs/names of indexers where you have an active paid plan. Health checks only run against these.</span>
             </label>
-            <label data-manager-field>Grab limits per indexer (comma separated, same order)
+            <label data-manager-field class="align-2line">Grab limits per indexer (comma separated, same order)
               <input name="NZB_TRIAGE_PRIORITY_INDEXER_LIMITS" type="text" placeholder="6,6" />
               <span class="field-hint">Max NZBs to grab per request from each paid indexer above. Same order as the indexer list. Default: 6 per indexer.</span>
             </label>
@@ -96,6 +95,7 @@
               <span class="field-hint">Optional — usually not needed. Only set this if an indexer has blocked your server's IP (common on cloud/VPS hosts). This proxies your NZB grabs only: Prowlarr/NZBHydra redirect each download to the real indexer, and this routes that fetch through the proxy. Searches are run by the manager itself — so to hide search traffic too, you must also add a proxy inside Prowlarr/NZBHydra (their own proxy settings). Leave blank for a direct connection. Local/LAN targets are bypassed automatically; use socks5h:// to resolve DNS at the proxy. Need one? Webshare (webshare.io) offers free proxies.</span>
             </label>
           </div>
+          <p class="hint hidden" data-direct-newznab-note>Direct Newznab selected — add and manage your indexers in the <strong>Direct Newznab Indexers</strong> section just below.</p>
           <div class="inline-actions" data-manager-field>
             <button type="button" class="secondary" data-test="indexer">Test Connection</button>
             <span class="status-message" data-test-status="indexer"></span>
@@ -137,7 +137,7 @@
                 </select>
               </label>
               <label>Test Search Query
-                <input name="NEWZNAB_TEST_QUERY" type="text" placeholder="e.g. Dune 2021 1080p" />
+                <input name="NEWZNAB_TEST_QUERY" type="text" placeholder="e.g. Tune 2021 1080p" />
                 <span class="field-hint">Runs a Newznab search against the configured endpoints and shows a quick summary.</span>
               </label>
             </div>
@@ -166,7 +166,7 @@
             </label>
             <label class="checkbox">
               <input name="EASYNEWS_TREAT_AS_INDEXER" type="checkbox" />
-              <span>Enable Health Checks</span>
+              <span>Enable Health Checks (often slows your results)</span>
             </label>
           </div>
           <div class="inline-actions">
@@ -476,7 +476,7 @@
               </label>
             </div>
             <details class="option-suggestions">
-              <summary>Show common examples</summary>
+              <summary>Quick-add common tags</summary>
               <p class="option-suggestions-hint">Click a chip to add it to the matching field above. You can still type any custom value directly into the fields.</p>
               <div class="option-suggestions-grid"
                    data-suggestions
@@ -521,7 +521,7 @@
               </label>
             </div>
             <details class="option-suggestions">
-              <summary>Show common examples</summary>
+              <summary>Quick-add common tags</summary>
               <p class="option-suggestions-hint">Click a chip to add it to the matching field above. You can still type any custom value directly into the fields.</p>
               <div class="option-suggestions-grid"
                    data-suggestions
@@ -620,8 +620,31 @@ date,
 languages,
 indexer,
 health'></textarea>
-              <span class="field-hint">Comma-separated fields. Example: <code>title, stream_quality, health, source, codec, visual, audio, group, size, files, date, languages, indexer</code>. Use <code>stream_quality</code> for actual parsed quality (e.g., BluRay/WEB-DL). Use <code>files</code> for file count and <code>date</code> for publish date. Advanced templates are still supported if you use <code>{...}</code>.</span>
+              <span class="field-hint">Comma-separated fields. Example: <code>title, filename, stream_quality, source, codec, visual, audio, group, size, bitrate, languages, indexer, files, date, health</code>. See <strong>What each field means</strong> below for every field (<code>bitrate</code> needs TMDb runtime). Advanced templates are still supported if you use <code>{...}</code>.</span>
             </label>
+            <details class="option-suggestions wide-field">
+              <summary>What each field means</summary>
+              <div class="option-suggestions-hint">
+                <code>title</code> — movie / show title<br>
+                <code>filename</code> — full release filename<br>
+                <code>stream_quality</code> — parsed quality (BluRay, WEB-DL, …)<br>
+                <code>quality</code> / <code>resolution</code> — resolution (4K, 1080p, …)<br>
+                <code>source</code> — release source<br>
+                <code>codec</code> — video codec (x265, x264, …)<br>
+                <code>visual</code> — visual tags (HDR, DV, …)<br>
+                <code>audio</code> — audio tags (Atmos, DDP5.1, …)<br>
+                <code>group</code> — release group<br>
+                <code>size</code> — file size<br>
+                <code>bitrate</code> — video bitrate in Mbps (only when TMDb runtime is known)<br>
+                <code>languages</code> — audio languages<br>
+                <code>indexer</code> — indexer name<br>
+                <code>health</code> — health-check result (✅ / ❌)<br>
+                <code>instant</code> — instant-play ⚡ marker<br>
+                <code>files</code> — number of files in the NZB (the video plus extras like sample, .nfo and .par2 repair files), when the indexer reports it<br>
+                <code>grabs</code> — how many times the release has been downloaded · <code>date</code> — publish date<br>
+                <code>addon</code> — addon name
+              </div>
+            </details>
             <div class="wide-field preview-card">
               <div class="preview-header">
                 <span>Live Preview</span>
@@ -629,7 +652,7 @@ health'></textarea>
               </div>
               <div class="preview-item">
                 <span class="preview-label" id="previewShortName">UsenetStreamer ✅ ⚡ 4K</span>
-                <div class="preview-desc" id="previewDescription">🎬 Dune Part Two
+                <div class="preview-desc" id="previewDescription">🎬 Tune Part Two
 ✨ WEB-DL
 🎥 WEB-DL
 🎞️ x265
@@ -649,14 +672,13 @@ health'></textarea>
           <h3>NZBDav Connection</h3>
           <div class="field-grid">
             <label>NZBDav URL
-              <input name="NZBDAV_URL" type="url" placeholder="http://localhost:3000 or http://nzbdav:3000" />
-              <span class="field-hint">In Docker, use the service/container name instead of localhost — e.g. http://nzbdav:3000. localhost only works if NZBDav runs in the same container as the addon.</span>
+              <input name="NZBDAV_URL" type="url" placeholder="http://your-lan-ip:3000 or http://nzbdav:3000" />
             </label>
             <label>NZBDav API Key
               <input name="NZBDAV_API_KEY" type="password" autocomplete="new-password" />
             </label>
             <label>WebDAV URL
-              <input name="NZBDAV_WEBDAV_URL" type="url" placeholder="http://localhost:3000 or http://nzbdav:3000" />
+              <input name="NZBDAV_WEBDAV_URL" type="url" placeholder="http://your-lan-ip:3000 or http://nzbdav:3000" />
             </label>
             <label>WebDAV User
               <input name="NZBDAV_WEBDAV_USER" type="text" />
@@ -694,16 +716,17 @@ health'></textarea>
         <section class="group" id="streamProtectionGroup">
           <h3>Stream Protection</h3>
           <div class="field-grid">
-            <label class="wide-field">Protection Mode
+            <label class="wide-field">Protection Mode (how do you want the addon to handle missing articles?)
               <select name="NZB_STREAM_PROTECTION" id="streamProtectionSelect">
                 <option value="none">No Protection</option>
                 <option value="auto-advance" selected>Auto-Advance Only</option>
                 <option value="health-check">Upfront Health Check</option>
-                <option value="health-check-auto-advance">Upfront Health Check + Auto-Advance (recommended if wrapped in an aggregator addon)</option>
+                <option value="health-check-auto-advance">Upfront Health Check + Auto-Advance (recommended if wrapped in AIO)</option>
                 <option value="smart-play-only">Background Health Check + Smart Play</option>
                 <option value="smart-play">Background Health Check + Smart Play + Auto-Advance (recommended for standalone)</option>
               </select>
             </label>
+            <p class="notice hidden wide-field" id="protectionNntpNote">⚠ This mode runs health checks, which need your Usenet/NNTP provider login — fill in the “NNTP Health Check Credentials” section below, or health checks can't run.</p>
             <!-- Auto-Advance Backup Strategy hidden for now — defaulting to on-demand (slower failover)
             <label id="autoAdvanceStrategyLabel">Auto-Advance Backup Strategy
               <select name="NZB_AUTO_ADVANCE_STRATEGY" id="autoAdvanceStrategySelect">
@@ -746,7 +769,7 @@ health'></textarea>
                   <td><strong>Auto-Advance Only</strong></td>
                   <td>If the stream you click fails in NZBDav, the addon automatically advances to and plays the next available NZB. No health badges are shown.</td>
                   <td>⚡ Instant start, slow failover</td>
-                  <td>You may not always play what you clicked. Auto-advance can take 5–30s while NZBDav processes the next NZB, depending on file size. Not suitable for large files. Sessions expire after 72 hours or when you save config changes.</td>
+                  <td>If the one you click fails, the addon plays the very next result per your sorting. Auto-advance can take 5–30s while NZBDav processes the next NZB, depending on file size. Not suitable for large files. Sessions expire after 72 hours or when you save config changes.</td>
                 </tr>
                 <tr>
                   <td><strong>Upfront Health Check</strong></td>
@@ -770,7 +793,7 @@ health'></textarea>
                   <td><strong>BG Health Check + Smart Play + Auto-Advance</strong></td>
                   <td>Same as above, plus auto-advance on all streams. If any stream you click fails in NZBDav, the addon automatically advances to the next available NZB. Smart Play also has its own auto-advance. Badges populate instantly on subsequent requests from cache.</td>
                   <td>⚡ Instant results, fastest playback start time</td>
-                  <td>Maximum protection — you almost never see a failure screen. Trade-off: you may not always play what you clicked when a normal stream fails. Sessions expire after 72 hours or when you save config changes.</td>
+                  <td>Maximum protection — you almost never see a failure screen. If the one you click fails, the addon plays the very next verified result per your sorting. Sessions expire after 72 hours or when you save config changes.</td>
                 </tr>
               </tbody>
             </table>

@@ -282,7 +282,7 @@ function detectProtectionBlock(status, contentType, body) {
     normalizedBody.includes('cf-challenge') ||
     normalizedBody.includes('attention required');
   if (!looksLikeChallenge) return null;
-  return 'Blocked by Cloudflare/WAF challenge (HTTP 403). Whitelist your server IP with the indexer.';
+  return 'Blocked by Cloudflare/WAF challenge (HTTP 403). Whitelist your server IP with the indexer, or add a proxy (e.g. a free Webshare proxy) in this indexer\'s Advanced settings below.';
 }
 
 function normalizeCapsType(rawType) {

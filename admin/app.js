@@ -1131,7 +1131,7 @@
         // ignore json parse errors
       }
       if (response.status === 401) {
-        throw new Error('Unauthorized: check your addon token');
+        throw new Error('Unauthorized: enter your admin token again and reload the configuration.');
       }
       throw new Error(message || 'Request failed');
     }
@@ -1423,6 +1423,7 @@
   const smartPlayModeLabel = document.getElementById('smartPlayModeLabel');
   const smartPlayModeSelect = document.getElementById('smartPlayModeSelect');
   const healthCheckCredentialsGroup = document.getElementById('healthCheckCredentialsGroup');
+  const protectionNntpNote = document.getElementById('protectionNntpNote');
   const healthRequiredFields = Array.from(configForm.querySelectorAll('[data-health-required]'));
   const triageCandidateSelect = configForm.querySelector('select[name="NZB_TRIAGE_MAX_CANDIDATES"]');
   const triageConnectionsInput = configForm.querySelector('input[name="NZB_TRIAGE_MAX_CONNECTIONS"]');
@@ -1435,6 +1436,20 @@
       if (needsNntp) field.setAttribute('required', 'required');
       else field.removeAttribute('required');
     });
+  }
+
+  // Warn about NNTP creds only when a health-check mode is selected AND the
+  // provider login isn't filled in yet — clears once host/user/pass are set.
+  // (A saved password loads as the masked sentinel, which counts as present.)
+  function updateProtectionNntpNote() {
+    if (!protectionNntpNote) return;
+    const mode = streamProtectionSelect?.value || 'none';
+    const needsNntp = ['health-check', 'health-check-auto-advance', 'smart-play-only', 'smart-play'].includes(mode);
+    const credsMissing = ['NZB_TRIAGE_NNTP_HOST', 'NZB_TRIAGE_NNTP_USER', 'NZB_TRIAGE_NNTP_PASS'].some((name) => {
+      const field = configForm.querySelector(`[name="${name}"]`);
+      return !field || !String(field.value || '').trim();
+    });
+    protectionNntpNote.classList.toggle('hidden', !(needsNntp && credsMissing));
   }
 
   function getConnectionLimit() {
@@ -1473,6 +1488,10 @@
 
     // Show/hide NNTP credentials section — always visible now
     // (needed for Zyclops even in no-protection/auto-advance modes)
+
+    // Health-check modes can't run without NNTP creds — flag it right at the
+    // mode dropdown, but only while the provider login is still missing.
+    updateProtectionNntpNote();
 
     // Show/hide auto-advance strategy dropdown (only for modes with auto-advance)
     if (autoAdvanceStrategyLabel) {
@@ -1610,6 +1629,12 @@
     } else {
       managerFields.forEach((field) => field.classList.toggle('hidden', managerValue === 'none'));
     }
+
+    // When Direct Newznab is the active source, the manager fields are hidden,
+    // so point the user to the "Direct Newznab Indexers" section below.
+    const usingDirectNewznab = managerValue === 'none' || streamingMode === 'native';
+    const directNote = configForm.querySelector('[data-direct-newznab-note]');
+    if (directNote) directNote.classList.toggle('hidden', !usingDirectNewznab);
 
     const indexerInput = configForm.querySelector('input[name="INDEXER_MANAGER_INDEXERS"]');
     const indexerHint = indexerInput && indexerInput.nextElementSibling;
@@ -1822,6 +1847,11 @@
   if (streamProtectionSelect) {
     streamProtectionSelect.addEventListener('change', () => syncStreamProtectionControls(false));
   }
+  // Re-evaluate the NNTP-creds note as the user fills in the provider login.
+  ['NZB_TRIAGE_NNTP_HOST', 'NZB_TRIAGE_NNTP_USER', 'NZB_TRIAGE_NNTP_PASS'].forEach((name) => {
+    const field = configForm.querySelector(`[name="${name}"]`);
+    if (field) field.addEventListener('input', updateProtectionNntpNote);
+  });
   if (autoAdvanceStrategySelect) {
     autoAdvanceStrategySelect.addEventListener('change', () => syncStreamProtectionControls(false));
   }
@@ -2307,7 +2337,7 @@
     const mockData = {
       // Nested context (matches the upstream template schema)
       stream: {
-        title: 'Dune Part Two',
+        title: 'Tune Part Two',
         proxied: true,
         private: false,
         resolution: '2160p',
@@ -2322,11 +2352,15 @@
         audioChannels: ['5.1'],
         seeders: 0,
         size: 16535624089.6, // 15.4 GB in bytes
+        bitrate: '13.3 Mbps', // ~ size*8 / (166 min * 60)
+        files: 24,
+        date: '2024-03-01',
+        grabs: 1280,
         folderSize: 0,
         indexer: 'NZBGeek',
         languages: ['English'],
         network: '',
-        filename: 'Dune.Part.Two.2024.2160p.WEB-DL.DDP5.1.Atmos.DV.HDR10.H.265-FLUX.mkv',
+        filename: 'Tune.Part.Two.2024.2160p.WEB-DL.DDP5.1.Atmos.DV.HDR10.H.265-FLUX.mkv',
         message: 'I like turtles',
         releaseGroup: 'FLUX',
         shortName: 'NZBGeek',
@@ -2344,16 +2378,18 @@
     };
 
     const defaultShortPattern = 'addon, health, instant, resolution';
-    const defaultDescPattern = 'title,\nstream_quality,\nsource,\ncodec,\nvisual,\naudio,\ngroup,\nsize,\nlanguages,\nindexer,\nhealth';
+    const defaultDescPattern = 'title,\nstream_quality,\nsource,\ncodec,\nvisual,\naudio,\ngroup,\nsize,\nbitrate,\nlanguages,\nindexer,\nfiles,\ndate,\nhealth';
     const legacyDescPattern = 'filename,\nsource,\ncodec,\nvisual,\naudio,\ngroup,\nsize,\nlanguages,\nindexer';
     const previousDefaultDescPattern = 'title,\nsource,\ncodec,\nvisual,\naudio,\ngroup,\nsize,\nlanguages,\nindexer';
+    // The prior default (no bitrate/files/date) — bump users still on it.
+    const supersededDefaultDescPattern = 'title,\nstream_quality,\nsource,\ncodec,\nvisual,\naudio,\ngroup,\nsize,\nlanguages,\nindexer,\nhealth';
 
     if (shortInput && !shortInput.value.trim()) {
       shortInput.value = defaultShortPattern;
     }
     if (descInput) {
       const currentDesc = descInput.value.trim();
-      if (!currentDesc || currentDesc === legacyDescPattern || currentDesc === previousDefaultDescPattern) {
+      if (!currentDesc || currentDesc === legacyDescPattern || currentDesc === previousDefaultDescPattern || currentDesc === supersededDefaultDescPattern) {
         descInput.value = defaultDescPattern;
       }
     }
@@ -2386,6 +2422,10 @@
             codec: '{stream.encode::exists["{stream.encode}"||""]}',
             group: '{stream.releaseGroup::exists["{stream.releaseGroup}"||""]}',
             size: '{stream.size::>0["{stream.size::bytes}"||""]}',
+            bitrate: '{stream.bitrate::exists["{stream.bitrate}"||""]}',
+            files: '{stream.files::exists["{stream.files} files"||""]}',
+            date: '{stream.date::exists["{stream.date}"||""]}',
+            grabs: '{stream.grabs::exists["{stream.grabs} grabs"||""]}',
             languages: '{stream.languages::join(" ")::exists["{stream.languages::join(\" \")}"||""]}',
             indexer: '{stream.indexer::exists["{stream.indexer}"||""]}',
             filename: '{stream.filename::exists["{stream.filename}"||""]}',
@@ -2402,6 +2442,10 @@
             audio: '{stream.audioTags::join(" ")::exists["🎧 {stream.audioTags::join(\" \")}"||""]}',
             group: '{stream.releaseGroup::exists["👥 {stream.releaseGroup}"||""]}',
             size: '{stream.size::>0["📦 {stream.size::bytes}"||""]}',
+            bitrate: '{stream.bitrate::exists["📶 {stream.bitrate}"||""]}',
+            files: '{stream.files::exists["📁 {stream.files} files"||""]}',
+            date: '{stream.date::exists["📅 {stream.date}"||""]}',
+            grabs: '{stream.grabs::exists["⬇️ {stream.grabs} grabs"||""]}',
             languages: '{stream.languages::join(" ")::exists["🌎 {stream.languages::join(\" \")}"||""]}',
             indexer: '{stream.indexer::exists["🔎 {stream.indexer}"||""]}',
             health: '{stream.health::exists["🧪 {stream.health}"||""]}',
@@ -2444,6 +2488,10 @@
         codec: '{stream.encode::exists["{stream.encode}"||""]}',
         group: '{stream.releaseGroup::exists["{stream.releaseGroup}"||""]}',
         size: '{stream.size::>0["{stream.size::bytes}"||""]}',
+        bitrate: '{stream.bitrate::exists["{stream.bitrate}"||""]}',
+        files: '{stream.files::exists["{stream.files} files"||""]}',
+        date: '{stream.date::exists["{stream.date}"||""]}',
+        grabs: '{stream.grabs::exists["{stream.grabs} grabs"||""]}',
         languages: '{stream.languages::join(" ")::exists["{stream.languages::join(\" \")}"||""]}',
         indexer: '{stream.indexer::exists["{stream.indexer}"||""]}',
         filename: '{stream.filename::exists["{stream.filename}"||""]}',
@@ -2460,6 +2508,10 @@
         audio: '{stream.audioTags::join(" ")::exists["🎧 {stream.audioTags::join(\" \")}"||""]}',
         group: '{stream.releaseGroup::exists["👥 {stream.releaseGroup}"||""]}',
         size: '{stream.size::>0["📦 {stream.size::bytes}"||""]}',
+        bitrate: '{stream.bitrate::exists["📶 {stream.bitrate}"||""]}',
+        files: '{stream.files::exists["📁 {stream.files} files"||""]}',
+        date: '{stream.date::exists["📅 {stream.date}"||""]}',
+        grabs: '{stream.grabs::exists["⬇️ {stream.grabs} grabs"||""]}',
         languages: '{stream.languages::join(" ")::exists["🌎 {stream.languages::join(\" \")}"||""]}',
         indexer: '{stream.indexer::exists["🔎 {stream.indexer}"||""]}',
         health: '{stream.health::exists["🧪 {stream.health}"||""]}',

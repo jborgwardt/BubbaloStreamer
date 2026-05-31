@@ -215,22 +215,20 @@ header h1 {
   min-width: 0;
 }
 
-/* Reserve a uniform two-line label-text height so inputs in the same grid row
-   line up even when one label is a single line and its neighbours wrap to two.
-   The floor (3.5em) comfortably holds two lines, so 1- and 2-line labels both
-   sit at exactly that height and their inputs align. The earlier minmax(2.7em)
-   was too short — two-line labels (~51px) grew past the 1-line floor (40.5px),
-   leaving an ~11px gap. 3.5em (~52.5px) covers two lines; `auto` lets a rare
-   3-line label grow rather than clip. Checkboxes are excluded — flex rows. */
-.field-grid label:not(.checkbox) {
+.field-grid label.wide-field {
+  grid-column: 1 / -1;
+}
+
+/* Opt-in ONLY for the few labels that share a row with a two-line neighbour
+   (the Indexer-Manager "Indexer IDs / Names" / "paid subscriptions" / "grab
+   limits" row). Reserving a uniform two-line label height makes their inputs
+   line up. Scoped to this class so the rest of the app keeps its normal
+   label→input spacing. */
+.field-grid label.align-2line {
   display: grid;
   grid-template-rows: minmax(3.5em, auto) auto;
   grid-auto-rows: auto;
   align-content: start;
-}
-
-.field-grid label.wide-field {
-  grid-column: 1 / -1;
 }
 
 /* Any direct child of .field-grid that opts into wide-field spans the row,

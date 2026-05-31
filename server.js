@@ -3464,6 +3464,9 @@ async function streamHandler(req, res) {
         audioChannels: [], // Not strictly parsed yet, usually part of audioTags
         seeders: 0, // Usenet doesn't have seeders
         size: result.size || 0, // Raw bytes
+        bitrate: Number.isFinite(result.bitrate) && result.bitrate > 0
+          ? `${(result.bitrate / 1000000).toFixed(1)} Mbps`
+          : null, // derived from size + TMDb runtime; null when runtime unknown
         folderSize: 0,
         indexer: namingContext.indexer,
         languages: releaseLanguageLabels.length > 0 ? releaseLanguageLabels : (sourceLanguageLabel ? [sourceLanguageLabel] : []),
@@ -3522,6 +3525,7 @@ async function streamHandler(req, res) {
           codec: '{stream.encode::exists["{stream.encode}"||""]}',
           group: '{stream.releaseGroup::exists["{stream.releaseGroup}"||""]}',
           size: '{stream.size::>0["{stream.size::bytes}"||""]}',
+          bitrate: '{stream.bitrate::exists["{stream.bitrate}"||""]}',
           languages: '{stream.languages::join(" ")::exists["{stream.languages::join(\" \")}"||""]}',
           indexer: '{stream.indexer::exists["{stream.indexer}"||""]}',
           filename: '{stream.filename::exists["{stream.filename}"||""]}',
@@ -3541,6 +3545,7 @@ async function streamHandler(req, res) {
           audio: '{stream.audioTags::join(" ")::exists["🎧 {stream.audioTags::join(\" \")}"||""]}',
           group: '{stream.releaseGroup::exists["👥 {stream.releaseGroup}"||""]}',
           size: '{stream.size::>0["📦 {stream.size::bytes}"||""]}',
+          bitrate: '{stream.bitrate::exists["📶 {stream.bitrate}"||""]}',
           languages: '{stream.languages::join(" ")::exists["🌎 {stream.languages::join(\" \")}"||""]}',
           indexer: '{stream.indexer::exists["🔎 {stream.indexer}"||""]}',
           health: '{stream.health::exists["🧪 {stream.health}"||""]}',
