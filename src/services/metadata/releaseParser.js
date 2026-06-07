@@ -1,5 +1,6 @@
 const { parseTorrentTitle } = require('../../utils/lib/parse-torrent-title/index.js');
 const { normalizeResolutionToken } = require('../../utils/parsers');
+const { classifyRelease } = require('./releaseClassifier');
 
 const QUALITY_FEATURE_PATTERNS = [
   { label: 'DV', regex: /\b(dolby\s*vision|dolbyvision|dv)\b/i },
@@ -11,38 +12,6 @@ const QUALITY_FEATURE_PATTERNS = [
   // markers include "AI", "AI Enhanced", "AI Upscale", "Topaz".
   { label: 'AI', regex: /\b(ai[-_. ](?:upscal|enhanc|remaster)|ai\s*enhanc|topaz(?:[-_. ]?(?:video[-_. ]?ai|vai))?)/i },
 ];
-
-// Audio channel patterns — labels aligned with the import schema so imported
-// configs map cleanly. Strict boundaries (non-digit before/after, required
-// separator) prevent false positives like "2024" matching "2.0".
-const AUDIO_CHANNEL_PATTERNS = [
-  { label: '7.1', regex: /(?<!\d)7[ .\-_]1(?:ch)?(?!\d)/i },
-  { label: '6.1', regex: /(?<!\d)6[ .\-_]1(?:ch)?(?!\d)/i },
-  { label: '5.1', regex: /(?<!\d)5[ .\-_]1(?:ch)?(?!\d)/i },
-  { label: '2.0', regex: /(?<!\d)2[ .\-_]0(?:ch)?(?!\d)/i },
-  // "Stereo" tag is treated as 2.0 (same channel count). Emitting 2.0
-  // keeps the canonical form so sort/filter synonym maps work uniformly.
-  { label: '2.0', regex: /\bstereo\b/i },
-  // "Mono" → 1.0.
-  { label: '1.0', regex: /\bmono\b/i },
-  // Channel-count shorthand seen in real releases (e.g. "...x265.6ch...",
-  // "...8 ch..."): 8ch = 7.1, 6ch = 5.1. Emit the canonical X.Y label directly.
-  // A preceding DIGIT is excluded so a year fragment like "...216ch" can't
-  // match; the token itself is "6ch"/"8ch" with optional whitespace before "ch".
-  { label: '7.1', regex: /(?<!\d)8\s*ch(?!\d)/i },
-  { label: '5.1', regex: /(?<!\d)6\s*ch(?!\d)/i },
-];
-
-function detectAudioChannels(rawTitle) {
-  if (!rawTitle) return [];
-  const found = [];
-  for (const { label, regex } of AUDIO_CHANNEL_PATTERNS) {
-    if (regex.test(rawTitle) && !found.includes(label)) {
-      found.push(label);
-    }
-  }
-  return found;
-}
 
 // Meta-language values aren't actual languages — they describe a property of
 // the release (e.g. has multiple audio tracks, audio is dubbed, audio matches
@@ -385,6 +354,13 @@ function parseReleaseMetadata(title) {
     inferredLanguages.push('Dubbed');
   }
 
+  // Canonical classification for the derived sort/filter fields. We use the
+  // title parser (@viren070/parse-torrent-title) for title/season/episode
+  // above, then the regex table in releaseClassifier.js for quality / encode /
+  // visualTags / audioTags / audioChannels so these values match the import
+  // schema vocabulary (OPTION_VOCAB) exactly.
+  const classified = classifyRelease(rawTitle, parsed.title);
+
   // Map library fields to internal schema
   return {
     parsedTitle, // Parsed title (stripped of metadata)
@@ -392,7 +368,14 @@ function parseReleaseMetadata(title) {
     resolution,
     languages: realLanguages,
     inferredLanguages,
-    qualityLabel: parsed.quality || parsed.source || parsed.codec || null,
+    // Canonical quality tier (BluRay REMUX / WEB-DL / TS / TC / …). Any "remux"
+    // — even standalone — folds into "BluRay REMUX"; there is no bare REMUX
+    // tier. Strictly the canonical tier (or null → "Unknown"); we deliberately
+    // do NOT fall back to the raw codec, which would leak labels like "divx".
+    qualityLabel: classified.quality || null,
+    // Encode tier (HEVC / AVC / AV1 / XviD / DivX). Distinct from `codec` below,
+    // which keeps the raw codec string from the title parser for display/keywords.
+    encode: classified.encode || null,
     qualityScore,
     codec: parsed.codec || null,
     source: parsed.source || null,
@@ -424,10 +407,12 @@ function parseReleaseMetadata(title) {
     region: parsed.region || null,
     threeD: parsed.threeD || null,
     bitDepth: parsed.bitDepth || null,
-    visualTags: QUALITY_FEATURE_PATTERNS
-      .filter(({ regex }) => regex.test(rawTitle))
-      .map(({ label }) => label),
-    audioChannels: detectAudioChannels(rawTitle),
+    // Canonical visualTags (incl. derived HDR+DV / DV Only / HDR Only),
+    // audioTags, and audioChannels — see releaseClassifier.js. These replace the
+    // previous bespoke pattern lists so values match the import schema vocabulary.
+    visualTags: classified.visualTags,
+    audioTags: classified.audioTags,
+    audioChannels: classified.audioChannels,
     // Bitrate is intentionally NOT parsed from the title. It is derived later
     // from file size + TMDb runtime in annotateNzbResult (see helpers.js).
   };

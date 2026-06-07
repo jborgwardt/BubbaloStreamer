@@ -13,6 +13,7 @@
   const stremioAppButton = document.getElementById('installStremioApp');
   const healthPaidWarning = document.getElementById('healthPaidWarning');
   const saveButton = configForm.querySelector('button[type="submit"]');
+  let currentProfileSlug = null; // null = Default/global; a slug = editing that profile (declared early so syncSaveGuard can read it)
   const sourceGuardNotice = document.getElementById('sourceGuardNotice');
   const qualityHiddenInput = configForm.querySelector('input[name="NZB_ALLOWED_RESOLUTIONS"]');
   const qualityCheckboxes = Array.from(configForm.querySelectorAll('[data-quality-option]'));
@@ -52,6 +53,9 @@
   const versionBadge = document.getElementById('addonVersionBadge');
   const streamingModeSelect = document.getElementById('streamingModeSelect');
   const nativeModeNotice = document.getElementById('nativeModeNotice');
+  const nativeHttpNotice = document.getElementById('nativeHttpNotice');
+  const nativeHttpsNotice = document.getElementById('nativeHttpsNotice');
+  const addonBaseUrlInput = document.querySelector('[name="ADDON_BASE_URL"]');
   const indexerManagerGroup = document.getElementById('indexerManagerGroup');
   const nzbdavGroup = document.getElementById('nzbdavGroup');
   const easynewsHttpsWarning = document.getElementById('easynewsHttpsWarning');
@@ -75,9 +79,9 @@
   const OPTION_VOCAB = {
     qualities: ['BluRay REMUX', 'BluRay', 'WEB-DL', 'WEBRip', 'HDRip', 'HC HD-Rip', 'DVDRip', 'HDTV', 'SCR', 'TC', 'TS', 'CAM', 'Unknown'],
     encodes: ['AV1', 'HEVC', 'AVC', 'XviD', 'DivX', 'Unknown'],
-    visualTags: ['HDR+DV', 'DV', 'HDR10+', 'HDR10', 'HDR', 'HLG', '10bit', 'SDR', 'IMAX', 'AI', '3D'],
-    audioTags: ['Atmos', 'DTS:X', 'TrueHD', 'DTS-HD MA', 'FLAC', 'DTS-HD', 'DTS-ES', 'DTS', 'DD+', 'DD', 'OPUS', 'AAC'],
-    audioChannels: ['7.1', '6.1', '5.1', '2.1', '2.0', 'Stereo', '1.0', 'Mono'],
+    visualTags: ['HDR+DV', 'DV Only', 'HDR Only', 'HDR10+', 'HDR10', 'DV', 'HDR', 'HLG', '10bit', '3D', 'IMAX', 'AI', 'SDR', 'H-OU', 'H-SBS', 'Unknown'],
+    audioTags: ['Atmos', 'DD+', 'DD', 'DTS:X', 'DTS-HD MA', 'DTS-HD', 'DTS-ES', 'DTS', 'TrueHD', 'OPUS', 'FLAC', 'AAC', 'Unknown'],
+    audioChannels: ['2.0', '5.1', '6.1', '7.1', 'Unknown'],
     // Meta-language tokens (Original / Multi / Dual Audio / Dubbed / Unknown)
     // first so power users see them at the top of the chip grid. Real
     // languages follow in rough usage-frequency order.
@@ -163,7 +167,9 @@
   function markSaving(isSaving) {
     saveInProgress = isSaving;
     if (!saveButton) return;
-    saveButton.textContent = isSaving ? 'Saving...' : 'Save Changes';
+    saveButton.textContent = isSaving ? 'Saving...'
+      : (currentProfileSlug === '__new__' ? 'Create profile'
+        : currentProfileSlug ? 'Save profile' : 'Save Changes');
     if (isSaving) {
       saveButton.disabled = true;
     } else {
@@ -195,6 +201,27 @@
     });
   }
 
+  // The server masks saved credentials (API keys, and proxies that embed
+  // user:pass@) by sending this zero-width-space-wrapped sentinel. Password
+  // inputs render it as dots automatically; text/url inputs (proxy fields) would
+  // otherwise show the raw sentinel string, so we mask those as a password too.
+  // The sentinel stays as the field's value, so an untouched save round-trips it
+  // back to the real value (the server swaps the sentinel for the stored value).
+  const MASK_SENTINEL = String.fromCharCode(0x200b) + "__MASKED_CREDENTIAL__" + String.fromCharCode(0x200b);
+
+  function applyMaskedDisplay(element, value) {
+    if (!element) return;
+    const isMasked = value === MASK_SENTINEL;
+    if (isMasked && (element.type === 'text' || element.type === 'url')) {
+      if (!element.dataset.maskedOrigType) element.dataset.maskedOrigType = element.type;
+      element.type = 'password';
+    } else if (element.dataset.maskedOrigType && !isMasked) {
+      // Repopulated with a real (non-masked) value — restore the visible type.
+      element.type = element.dataset.maskedOrigType;
+      delete element.dataset.maskedOrigType;
+    }
+  }
+
   function populateForm(values) {
     const elements = configForm.querySelectorAll('input[name], select[name], textarea[name]');
     elements.forEach((element) => {
@@ -215,6 +242,7 @@
         element.value = '';
       } else {
         element.value = rawValue ?? '';
+        applyMaskedDisplay(element, rawValue);
       }
     });
   }
@@ -645,6 +673,13 @@
   }
 
   function syncSaveGuard() {
+    // Profiles inherit the global indexer source, so the "no source" guard never
+    // applies while editing a profile — keep the save button enabled.
+    if (currentProfileSlug !== null) {
+      if (sourceGuardNotice) sourceGuardNotice.classList.add('hidden');
+      if (saveButton && !saveInProgress) saveButton.disabled = false;
+      return;
+    }
     const hasSource = hasActiveIndexerSource();
     if (sourceGuardNotice) {
       sourceGuardNotice.classList.toggle('hidden', hasSource);
@@ -760,6 +795,7 @@
         input.checked = parseBool(value);
       } else if (value !== undefined && value !== null) {
         input.value = value;
+        applyMaskedDisplay(input, value);
       }
     });
   }
@@ -1139,6 +1175,28 @@
     return response.json();
   }
 
+  // Re-sync all the rich form builders (chip pickers, sort-order builder, quality
+  // grid, pattern preview, control visibility) from the current field/hidden values.
+  // Extracted from loadConfiguration so profile mode can re-run it after overlaying a
+  // profile's overrides onto the form.
+  function refreshFormBuilders() {
+    setupPatternPreview();
+    applyLanguageSelectionsFromHidden();
+    applyQualitySelectionsFromHidden();
+    applySortOrderFromHidden();
+    refreshAllChipPickers();
+    applyTmdbLanguageSelectionsFromHidden();
+    syncTmdbLanguageControls();
+    refreshNewznabFieldNames();
+    syncStreamProtectionControls(true);
+    syncSortingControls();
+    syncStreamingModeControls();
+    syncManagerControls();
+    syncNewznabControls();
+    syncConfigWarnings();
+    if (typeof syncSortImportControls === 'function') syncSortImportControls();
+  }
+
   async function loadConfiguration() {
     authError.classList.add('hidden');
     markLoading(true);
@@ -1147,6 +1205,7 @@
     try {
       const data = await apiRequest('/admin/api/config');
       const values = data.values || {};
+      lastGlobalValues = values; // cached so profile mode can show inherited defaults
       loadedSortMode = (values.NZB_SORT_MODE || 'quality_then_size').toString().trim().toLowerCase();
       setAvailableNewznabPresets(data?.newznabPresets || []);
       updateVersionBadge(data?.addonVersion);
@@ -1175,23 +1234,9 @@
         const legacyDedupeOff = ['false', '0', 'off', 'no'].includes(legacyDedupeRaw);
         dedupeModeSelect.value = legacyDedupeOff ? 'off' : 'standard';
       }
-      setupPatternPreview(); // Initialize preview with loaded values
-      applyLanguageSelectionsFromHidden();
-      applyQualitySelectionsFromHidden();
-      applySortOrderFromHidden();
-      refreshAllChipPickers();
-      applyTmdbLanguageSelectionsFromHidden();
-      syncTmdbLanguageControls();
-      refreshNewznabFieldNames();
-      syncStreamProtectionControls(true);
-      syncSortingControls();
-      syncStreamingModeControls();
-      syncManagerControls();
-      syncNewznabControls();
-      syncConfigWarnings();
-      // Sync sort-import block visibility from the loaded toggle state
-      if (typeof syncSortImportControls === 'function') syncSortImportControls();
+      refreshFormBuilders();
       configSection.classList.remove('hidden');
+      loadProfiles();
       updateManifestLink(data.manifestUrl || '');
       runtimeEnvPath = data.runtimeEnvPath || null;
       const baseMessage = 'Use the install buttons once HTTPS and your shared token are set.';
@@ -1352,9 +1397,18 @@
     }
   }
 
+  // When editing a saved profile, install/copy targets THAT profile's manifest URL
+  // (insert /<slug> before /manifest.json); otherwise the global manifest.
+  function effectiveManifestUrl() {
+    if (currentProfileSlug && currentProfileSlug !== '__new__' && currentManifestUrl) {
+      return currentManifestUrl.replace(/\/manifest\.json([^/]*)$/, `/${currentProfileSlug}/manifest.json$1`);
+    }
+    return currentManifestUrl;
+  }
+
   async function copyManifestUrl() {
     if (!currentManifestUrl || copyManifestButton.disabled) return;
-    const url = currentManifestUrl;
+    const url = effectiveManifestUrl();
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(url);
@@ -1397,7 +1451,7 @@
 
   function openStremioWebInstall() {
     if (!currentManifestUrl) return;
-    const encoded = encodeURIComponent(currentManifestUrl);
+    const encoded = encodeURIComponent(effectiveManifestUrl());
     const url = `https://web.stremio.com/#/addons?addon=${encoded}`;
     const newWindow = window.open(url, '_blank', 'noopener,noreferrer');
     if (!newWindow) {
@@ -1407,7 +1461,7 @@
 
   function openStremioAppInstall() {
     if (!currentManifestUrl) return;
-    const deeplink = getStremioProtocolUrl(currentManifestUrl);
+    const deeplink = getStremioProtocolUrl(effectiveManifestUrl());
     const newWindow = window.open(deeplink, '_blank');
     if (!newWindow) {
       window.location.href = deeplink;
@@ -1663,10 +1717,20 @@
   function syncStreamingModeControls() {
     const mode = streamingModeSelect?.value || 'nzbdav';
     const isNativeMode = mode === 'native';
+    // Native-mode constraints only apply on plain HTTP. On HTTPS the addon
+    // proxies NZBs (encrypted, keys hidden) and any indexer/manager works.
+    // Empty/unknown base URL is treated as HTTP (the safe, restrictive default).
+    const isHttps = /^https:/i.test((addonBaseUrlInput?.value || '').trim());
 
-    // Show/hide native mode notice
+    // Show/hide native mode notice + the HTTP-only vs HTTPS sub-notices.
     if (nativeModeNotice) {
       nativeModeNotice.classList.toggle('hidden', !isNativeMode);
+    }
+    if (nativeHttpNotice) {
+      nativeHttpNotice.classList.toggle('hidden', !(isNativeMode && !isHttps));
+    }
+    if (nativeHttpsNotice) {
+      nativeHttpsNotice.classList.toggle('hidden', !(isNativeMode && isHttps));
     }
 
     if (easynewsHttpsWarning) {
@@ -1678,10 +1742,12 @@
       nzbdavGroup.classList.toggle('hidden', isNativeMode);
     }
 
-    // In native mode, force manager to 'none' and disable the select
+    // Native mode forces newznab-only ONLY on HTTP (the addon must hand Stremio
+    // the indexer's direct HTTPS link, and manager links are usually local/HTTP).
+    // On HTTPS the addon proxies NZBs server-side, so the manager works normally.
     if (indexerManagerGroup && managerSelect) {
-      if (isNativeMode) {
-        // Force to newznab only in native mode
+      if (isNativeMode && !isHttps) {
+        // Force to newznab only
         managerSelect.value = 'none';
         managerSelect.disabled = true;
         // Add a hint that manager is disabled
@@ -1689,7 +1755,7 @@
         if (!existingHint) {
           const hint = document.createElement('p');
           hint.className = 'hint native-mode-hint';
-          hint.textContent = 'Prowlarr/NZBHydra disabled in Windows Native mode. Use direct Newznab indexers below.';
+          hint.textContent = 'Prowlarr/NZBHydra disabled in Stremio Native mode on HTTP. Serve the addon over HTTPS to use them.';
           const h3 = indexerManagerGroup.querySelector('h3');
           if (h3) h3.after(hint);
         }
@@ -1790,6 +1856,7 @@
   async function saveConfiguration(event) {
     event.preventDefault();
     saveStatus.textContent = '';
+    if (currentProfileSlug !== null) { return saveProfileConfiguration(); }
 
     // Block save if any Zyclops is enabled but NNTP host is empty
     if (hasAnyZyclopsEnabled()) {
@@ -1828,6 +1895,257 @@
   });
 
   configForm.addEventListener('submit', saveConfiguration);
+
+  // ── Profiles (Option C top switcher) ────────────────────────────────────────
+  // currentProfileSlug (declared near the top): null = editing Default/global (saves via
+  // POST /config); a slug = editing that profile (only per-profile sections shown, each
+  // with an Inherit/Override toggle; saves via POST /profiles).
+  let profileOverrideMap = {};   // suffix -> global env key (= form field name)
+  let lastGlobalValues = {};     // cached global config, to show inherited defaults + restore
+  let knownProfiles = [];
+
+  const profileTabs = document.getElementById('profileTabs');
+  const profileEditRow = document.getElementById('profileEditRow');
+  const profileNameInput = document.getElementById('profileNameInput');
+  const deleteProfileBtn = document.getElementById('deleteProfileBtn');
+  const profileInstallHint = document.getElementById('profileInstallHint');
+  const profileMultiInstallWarning = document.getElementById('profileMultiInstallWarning');
+  const profileSections = Array.from(configForm.querySelectorAll('[data-profile-section]'));
+
+  function profileFieldNames() { return Object.values(profileOverrideMap); }
+  function globalKeyToSuffix() {
+    const inv = {};
+    Object.entries(profileOverrideMap).forEach(([suf, gk]) => { inv[gk] = suf; });
+    return inv;
+  }
+  function escapeHtmlText(s) { const d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; }
+  function slugifyName(name) {
+    return String(name || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+  }
+
+  async function loadProfiles() {
+    if (!profileTabs) return;
+    try {
+      const data = await apiRequest('/admin/api/profiles');
+      profileOverrideMap = data.overrideMap || {};
+      knownProfiles = data.profiles || [];
+      renderProfileTabs();
+    } catch (e) { /* profiles are optional; ignore */ }
+  }
+
+  // Visible tab bar: Default + every saved profile (always on screen — no hidden
+  // dropdown) + a transient "New (unsaved)" tab while creating + a "+ New profile"
+  // button. The active tab reflects what's being edited.
+  function renderProfileTabs() {
+    if (!profileTabs) return;
+    const active = currentProfileSlug || '__default__';
+    const tabs = [{ slug: '__default__', label: 'Default' }]
+      .concat(knownProfiles.map((p) => ({ slug: p.slug, label: p.name })));
+    if (currentProfileSlug === '__new__') tabs.push({ slug: '__new__', label: '✦ New (unsaved)' });
+    profileTabs.innerHTML = '';
+    tabs.forEach((t) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'profile-tab' + (t.slug === active ? ' active' : '');
+      btn.textContent = t.label;
+      btn.addEventListener('click', () => selectTab(t.slug));
+      profileTabs.appendChild(btn);
+    });
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'profile-tab profile-tab-add';
+    add.textContent = '+ New profile';
+    add.addEventListener('click', () => enterProfileMode(null, true));
+    profileTabs.appendChild(add);
+  }
+  function syncSwitcherToCurrent() { renderProfileTabs(); }
+
+  function selectTab(slug) {
+    if (slug === '__new__') return; // already creating
+    if (slug === '__default__') { enterDefaultMode(); return; }
+    const profile = knownProfiles.find((p) => p.slug === slug);
+    if (profile) enterProfileMode(profile, false);
+    else enterDefaultMode();
+  }
+
+  function setSectionOverride(section, on) {
+    section.classList.toggle('profile-inherit', !on);
+    // Override ON => expand the (collapsible) section so its fields are visible;
+    // inherit => collapse it (clean + dimmed). This is the key fix: checking
+    // "Override" now reveals the fields instead of leaving a collapsed empty section.
+    section.classList.toggle('section-collapsed', !on);
+    const chevron = section.querySelector('.section-collapse-toggle');
+    if (chevron) { chevron.textContent = on ? '▾' : '▸'; chevron.disabled = false; }
+    section.querySelectorAll('input[name], select[name], textarea[name], button').forEach((el) => {
+      if (el.hasAttribute('data-profile-override-toggle')) return;
+      if (el.classList.contains('section-collapse-toggle')) return; // keep the expand/collapse chevron usable
+      if (el.type === 'submit') return;
+      el.disabled = !on;
+    });
+    const toggle = section.querySelector('[data-profile-override-toggle]');
+    if (toggle) toggle.checked = on;
+  }
+
+  function ensureOverrideToggles() {
+    profileSections.forEach((section) => {
+      if (section.querySelector('[data-profile-override-toggle]')) return;
+      const h3 = section.querySelector('h3');
+      if (!h3) return;
+      const label = document.createElement('label');
+      label.className = 'profile-override-label';
+      label.innerHTML = '<input type="checkbox" data-profile-override-toggle /> Override for this profile';
+      // Don't let clicks on the override control bubble to the section collapse toggle.
+      label.addEventListener('click', (e) => e.stopPropagation());
+      h3.appendChild(label);
+      label.querySelector('input').addEventListener('change', (e) => setSectionOverride(section, e.target.checked));
+    });
+  }
+  function showOverrideToggles(show) {
+    profileSections.forEach((section) => {
+      const lbl = section.querySelector('.profile-override-label');
+      if (lbl) lbl.classList.toggle('hidden', !show);
+    });
+  }
+
+  function enterDefaultMode() {
+    currentProfileSlug = null;
+    syncSwitcherToCurrent();
+    if (profileEditRow) profileEditRow.classList.add('hidden');
+    if (profileInstallHint) profileInstallHint.classList.add('hidden');
+    // The multi-install warning is only relevant for non-default profiles —
+    // the Default profile is the one everyone installs, so hide it here.
+    if (profileMultiInstallWarning) profileMultiInstallWarning.classList.add('hidden');
+    configForm.classList.remove('profile-mode');
+    // Re-enable the per-profile section fields we disabled; shared sections are restored
+    // by removing profile-mode + refreshFormBuilders() below.
+    profileSections.forEach((s) => {
+      s.classList.remove('profile-inherit');
+      s.querySelectorAll('input[name], select[name], textarea[name], button').forEach((el) => { el.disabled = false; });
+    });
+    showOverrideToggles(false);
+    populateForm(lastGlobalValues);
+    refreshFormBuilders();
+    if (saveButton) saveButton.textContent = 'Save Changes';
+  }
+
+  function enterProfileMode(profile, isNew) {
+    currentProfileSlug = isNew ? '__new__' : profile.slug;
+    syncSwitcherToCurrent();
+    ensureOverrideToggles();
+    if (profileEditRow) profileEditRow.classList.remove('hidden');
+    // Show the "one profile per Stremio account" warning when editing any
+    // non-default profile (including a new, unsaved one).
+    if (profileMultiInstallWarning) profileMultiInstallWarning.classList.remove('hidden');
+    profileNameInput.value = isNew ? '' : profile.name;
+    deleteProfileBtn.classList.toggle('hidden', isNew);
+    // Hide shared sections via a form class so the rich builders (which toggle .hidden
+    // on shared groups by mode/manager) can't re-show them; CSS !important wins.
+    configForm.classList.add('profile-mode');
+    // Baseline = global config so inherited fields show the effective default.
+    populateForm(lastGlobalValues);
+    const g2s = globalKeyToSuffix();
+    const overrides = (profile && profile.overrides) || {};
+    profileSections.forEach((section) => {
+      section.classList.remove('hidden');
+      let hasOverride = false;
+      Array.from(section.querySelectorAll('input[name], select[name], textarea[name]')).forEach((el) => {
+        if (!profileFieldNames().includes(el.name)) {
+          // Shared field inside a per-profile section (e.g. Base URL / Stream Token in
+          // "Addon Name") — it stays global, so hide it while editing a profile.
+          const wrap = el.closest('label') || el.parentElement;
+          if (wrap) wrap.classList.add('profile-foreign-field');
+          return;
+        }
+        const suf = g2s[el.name];
+        if (suf && overrides[suf] !== undefined) {
+          hasOverride = true;
+          if (el.type === 'checkbox') el.checked = parseBool(overrides[suf]);
+          else el.value = overrides[suf];
+        }
+      });
+      setSectionOverride(section, hasOverride);
+    });
+    showOverrideToggles(true);
+    refreshFormBuilders();
+    // refreshFormBuilders may re-enable controls — re-apply inherit/override disabling.
+    profileSections.forEach((section) => {
+      const t = section.querySelector('[data-profile-override-toggle]');
+      setSectionOverride(section, Boolean(t && t.checked));
+    });
+    updateProfileInstallHint();
+    if (saveButton) { saveButton.disabled = false; saveButton.textContent = isNew ? 'Create profile' : 'Save profile'; }
+  }
+
+  function updateProfileInstallHint() {
+    if (!profileInstallHint) return;
+    const slug = slugifyName(profileNameInput.value);
+    if (!slug || !currentManifestUrl) { profileInstallHint.classList.add('hidden'); return; }
+    const url = currentManifestUrl.replace(/\/manifest\.json([^/]*)$/, `/${slug}/manifest.json$1`);
+    profileInstallHint.innerHTML = `Install this profile in Stremio: <code>${escapeHtmlText(url)}</code> — install only <strong>one</strong> profile per Stremio account (each installed profile makes this addon run again on every title).`;
+    profileInstallHint.classList.remove('hidden');
+  }
+
+  function gatherProfileOverrides() {
+    const overrides = {};
+    const g2s = globalKeyToSuffix();
+    profileSections.forEach((section) => {
+      const toggle = section.querySelector('[data-profile-override-toggle]');
+      if (!toggle || !toggle.checked) return; // inherit -> omit (cleared on the server)
+      section.querySelectorAll('input[name], select[name], textarea[name]').forEach((el) => {
+        const suf = g2s[el.name];
+        if (!suf) return;
+        let v;
+        if (el.type === 'checkbox') v = el.checked ? 'true' : 'false';
+        else if (el.multiple) v = Array.from(el.selectedOptions).map((o) => o.value).join(',');
+        else v = el.value != null ? String(el.value) : '';
+        overrides[suf] = v;
+      });
+    });
+    return overrides;
+  }
+
+  async function saveProfileConfiguration() {
+    const name = (profileNameInput.value || '').trim();
+    if (!name) { saveStatus.textContent = 'Error: enter a profile name.'; return; }
+    try {
+      markSaving(true);
+      const body = { name, overrides: gatherProfileOverrides() };
+      if (currentProfileSlug && currentProfileSlug !== '__new__') body.slug = currentProfileSlug;
+      const result = await apiRequest('/admin/api/profiles', { method: 'POST', body: JSON.stringify(body) });
+      const saved = result && result.profile;
+      saveStatus.textContent = `Profile "${name}" saved.`;
+      if (saved && saved.slug) currentProfileSlug = saved.slug;
+      await loadProfiles();
+      const justSaved = saved && saved.slug ? knownProfiles.find((p) => p.slug === saved.slug) : null;
+      if (justSaved) enterProfileMode(justSaved, false); else renderProfileTabs();
+    } catch (error) {
+      saveStatus.textContent = `Error: ${error.message}`;
+    } finally {
+      markSaving(false);
+    }
+  }
+
+  async function deleteCurrentProfile() {
+    if (!currentProfileSlug || currentProfileSlug === '__new__') {
+      enterDefaultMode();
+      return;
+    }
+    if (!window.confirm('Delete this profile? Its Stremio addon will stop working.')) return;
+    try {
+      await apiRequest(`/admin/api/profiles/${encodeURIComponent(currentProfileSlug)}`, { method: 'DELETE' });
+      saveStatus.textContent = 'Profile deleted.';
+      currentProfileSlug = null;
+      await loadProfiles();
+      enterDefaultMode();
+    } catch (error) {
+      saveStatus.textContent = `Error: ${error.message}`;
+    }
+  }
+
+  if (profileTabs) {
+    deleteProfileBtn.addEventListener('click', deleteCurrentProfile);
+    profileNameInput.addEventListener('input', updateProfileInstallHint);
+  }
 
   const testButtons = configForm.querySelectorAll('button[data-test]');
   testButtons.forEach((button) => {
@@ -1959,6 +2277,14 @@
 
   if (streamingModeSelect) {
     streamingModeSelect.addEventListener('change', () => {
+      syncStreamingModeControls();
+    });
+  }
+
+  // Re-evaluate native-mode HTTP/HTTPS constraints when the base URL changes,
+  // so the warning + manager controls reflect http:// vs https:// live.
+  if (addonBaseUrlInput) {
+    addonBaseUrlInput.addEventListener('input', () => {
       syncStreamingModeControls();
     });
   }
@@ -2345,10 +2671,10 @@
         quality: 'WEB-DL',
         streamQuality: 'WEB-DL',
         resolutionQuality: '4K',
-        encode: 'x265',
+        encode: 'HEVC',
         type: 'movie',
-        visualTags: ['HDR', 'DV'],
-        audioTags: ['Atmos', 'DDP5.1'],
+        visualTags: ['HDR+DV', 'HDR10', 'DV'],
+        audioTags: ['Atmos', 'DD+'],
         audioChannels: ['5.1'],
         seeders: 0,
         size: 16535624089.6, // 15.4 GB in bytes

@@ -55,6 +55,19 @@ const AUDIO_CHANNEL_SYNONYMS = {
   '2.0': '2.0', '2.0ch': '2.0', 'stereo': '2.0',
   '1.0': '1.0', '1.0ch': '1.0', 'mono': '1.0',
 };
+// Quality aliases. The canonical tier set has no standalone "REMUX" — any remux
+// folds into "BluRay REMUX". Old configs that stored a bare "REMUX" (or the old
+// parser's "TeleSync"/"TeleCine" labels) would otherwise stop matching, so map
+// those legacy/alias spellings onto the canonical tier. Unmapped values fall
+// through to themselves (canonicalize's `|| s`), so all other quality matching
+// is unchanged.
+const QUALITY_SYNONYMS = {
+  'remux': 'bluray remux',
+  'bd remux': 'bluray remux', 'br remux': 'bluray remux', 'uhd remux': 'bluray remux',
+  'bdremux': 'bluray remux', 'brremux': 'bluray remux', 'uhdremux': 'bluray remux',
+  'telesync': 'ts',
+  'telecine': 'tc',
+};
 const RESOLUTION_SYNONYMS = {
   '4k': '4k', '2160p': '4k', 'uhd': '4k',
   '8k': '8k', '4320p': '8k',
@@ -219,8 +232,9 @@ function getStreamQuality(stream) {
 
 function getStreamEncode(stream) {
   if (!stream) return null;
-  // parser produces `codec`, not `encode` — read the right field on fallback.
-  return stream.codec || stream.parsedFile?.codec || null;
+  // Prefer the canonical `encode` tier (HEVC/AVC/AV1/XviD/DivX). Fall back to
+  // the raw `codec` for streams parsed before the classifier landed.
+  return stream.encode || stream.parsedFile?.encode || stream.codec || stream.parsedFile?.codec || null;
 }
 
 function getStreamReleaseGroup(stream) {
@@ -230,18 +244,26 @@ function getStreamReleaseGroup(stream) {
 
 function getStreamVisualTags(stream) {
   if (!stream) return [];
+  // Canonical visualTags (incl. derived HDR+DV / DV Only / HDR Only). When
+  // present, use them verbatim. Fall back to the raw hdr list only for streams
+  // parsed before the classifier landed.
   const visual = Array.isArray(stream.visualTags) ? stream.visualTags : [];
-  const hdr = Array.isArray(stream.hdrList) ? stream.hdrList : [];
   const parsed = Array.isArray(stream.parsedFile?.visualTags) ? stream.parsedFile.visualTags : [];
-  return [...visual, ...hdr, ...parsed];
+  if (visual.length || parsed.length) return [...visual, ...parsed];
+  const hdr = Array.isArray(stream.hdrList) ? stream.hdrList : [];
+  return [...hdr];
 }
 
 function getStreamAudioTags(stream) {
   if (!stream) return [];
+  // Canonical audioTags (Atmos/DD+/DTS:X/…). Fall back to the raw audio list
+  // for streams parsed before the classifier landed.
+  const tags = Array.isArray(stream.audioTags) ? stream.audioTags : [];
+  const parsed = Array.isArray(stream.parsedFile?.audioTags) ? stream.parsedFile.audioTags : [];
+  if (tags.length || parsed.length) return [...tags, ...parsed];
   const audio = Array.isArray(stream.audioList) ? stream.audioList : [];
-  // parser produces `audioList`, not `audioTags` — read the right fallback field.
-  const parsed = Array.isArray(stream.parsedFile?.audioList) ? stream.parsedFile.audioList : [];
-  return [...audio, ...parsed];
+  const parsedAudio = Array.isArray(stream.parsedFile?.audioList) ? stream.parsedFile.audioList : [];
+  return [...audio, ...parsedAudio];
 }
 
 function getStreamAudioChannels(stream) {
@@ -319,7 +341,7 @@ function valueForCriterion(criterion, stream, context = {}) {
 
     case 'quality': {
       const list = preferred.qualities || [];
-      const idx = listIndex(list, getStreamQuality(stream));
+      const idx = listIndex(list, getStreamQuality(stream), QUALITY_SYNONYMS);
       return indexScore(idx);
     }
 
@@ -416,6 +438,7 @@ module.exports = {
   AUDIO_CHANNEL_SYNONYMS,
   AUDIO_SYNONYMS,
   ENCODE_SYNONYMS,
+  QUALITY_SYNONYMS,
   RESOLUTION_SYNONYMS,
   LANGUAGE_SYNONYMS,
 };

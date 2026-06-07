@@ -9,6 +9,7 @@ const {
   searchNewznabIndexers,
   validateNewznabSearch,
 } = require('../services/newznab');
+const { extractNewznabError } = require('../services/indexer');
 
 let NNTPClientCtor = null;
 try {
@@ -155,39 +156,63 @@ async function testIndexerConnection(values) {
     throw new Error(`Unexpected response ${response.status} from Prowlarr`);
   }
 
-  // NZBHydra uses /api endpoint with query parameters for all operations
-  const params = { t: 'caps', o: 'json' };
-  if (apiKey) params.apikey = apiKey;
-  
+  // NZBHydra uses the /api endpoint with query parameters for all operations.
+  // IMPORTANT: the `caps` endpoint is typically served WITHOUT auth, so a caps
+  // 200 does NOT prove the API key is valid. We probe caps for reachability +
+  // version, then run a minimal authenticated SEARCH to actually validate the
+  // key — NZBHydra rejects a bad key with a newznab error body (code 100/101/102)
+  // while still returning HTTP 200.
   const hydraUrl = `${baseUrl}/api`;
-  const response = await axios.get(hydraUrl, {
-    params,
+  const capsResponse = await axios.get(hydraUrl, {
+    params: { t: 'caps', o: 'json', ...(apiKey ? { apikey: apiKey } : {}) },
     timeout,
     validateStatus: () => true,
     proxy: false,
     ...(buildProxyAgents(values?.INDEXER_MANAGER_PROXY, hydraUrl) || {}),
   });
-
-  if (response.status === 200) {
-    // Successful response from NZBHydra API
-    // Try to extract version from various possible response formats
-    let version = null;
-    if (response.data?.version) {
-      version = response.data.version;
-    } else if (response.data?.server?.version) {
-      version = response.data.server.version;
-    } else if (response.data?.['@attributes']?.version) {
-      version = response.data['@attributes'].version;
-    }
-    return formatVersionLabel('Connected to NZBHydra', version);
-  }
-  if (response.status === 401 || response.status === 403) {
+  if (capsResponse.status === 401 || capsResponse.status === 403) {
     throw new Error('Unauthorized: check NZBHydra API key');
   }
-  if (response.status === 400) {
+  if (capsResponse.status === 400) {
     throw new Error('Bad request to NZBHydra - verify URL format and API key');
   }
-  throw new Error(`Unexpected response ${response.status} from NZBHydra`);
+  if (capsResponse.status !== 200) {
+    throw new Error(`Unexpected response ${capsResponse.status} from NZBHydra`);
+  }
+  // Some NZBHydra setups validate the key even on caps (HTTP 200 + a newznab
+  // error body like {code:"100", description:"Wrong api key"}). Catch that here.
+  const capsError = extractNewznabError(capsResponse.data);
+  if (capsError && /^(100|101|102)$/.test(String(capsError.code || ''))) {
+    throw new Error('Unauthorized: check NZBHydra API key');
+  }
+  const version = capsResponse.data?.version
+    || capsResponse.data?.server?.version
+    || capsResponse.data?.['@attributes']?.version
+    || null;
+
+  // Validate the API key. Only fail on a DEFINITIVE auth rejection — a wrong key
+  // is rejected fast (before any indexer search), so a slow or unreachable
+  // validation search must not block an otherwise-valid setup.
+  try {
+    const searchResponse = await axios.get(hydraUrl, {
+      params: { t: 'search', q: 'test', limit: 1, o: 'json', ...(apiKey ? { apikey: apiKey } : {}) },
+      timeout,
+      validateStatus: () => true,
+      proxy: false,
+      ...(buildProxyAgents(values?.INDEXER_MANAGER_PROXY, hydraUrl) || {}),
+    });
+    if (searchResponse.status === 401 || searchResponse.status === 403) {
+      throw new Error('Unauthorized: check NZBHydra API key');
+    }
+    const apiError = extractNewznabError(searchResponse.data);
+    if (apiError && /^(100|101|102)$/.test(String(apiError.code || ''))) {
+      throw new Error('Unauthorized: check NZBHydra API key');
+    }
+  } catch (err) {
+    if (/Unauthorized/i.test(err?.message || '')) throw err;
+    // transient/network/timeout during validation — fall through to caps success
+  }
+  return formatVersionLabel('Connected to NZBHydra', version);
 }
 
 async function testNzbdavConnection(values) {

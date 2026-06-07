@@ -432,8 +432,9 @@ function compareByCustomChain(a, b, options = {}) {
     }
 
     if (criterion === 'encode') {
-      const aIdx = indexInPreferredByContains(a?.codec, preferredEncodes);
-      const bIdx = indexInPreferredByContains(b?.codec, preferredEncodes);
+      // Prefer canonical `encode` tier; fall back to raw `codec`.
+      const aIdx = indexInPreferredByContains(a?.encode || a?.codec, preferredEncodes);
+      const bIdx = indexInPreferredByContains(b?.encode || b?.codec, preferredEncodes);
       const cmp = compareIndexes(aIdx, bIdx);
       if (cmp !== 0) return cmp;
       continue;
@@ -448,14 +449,11 @@ function compareByCustomChain(a, b, options = {}) {
     }
 
     if (criterion === 'visual_tag') {
-      const aTags = [
-        ...(Array.isArray(a?.visualTags) ? a.visualTags : []),
-        ...(Array.isArray(a?.hdrList) ? a.hdrList : []),
-      ];
-      const bTags = [
-        ...(Array.isArray(b?.visualTags) ? b.visualTags : []),
-        ...(Array.isArray(b?.hdrList) ? b.hdrList : []),
-      ];
+      // Canonical visualTags; fall back to raw hdr list for old streams.
+      const aTags = (Array.isArray(a?.visualTags) && a.visualTags.length)
+        ? a.visualTags : (Array.isArray(a?.hdrList) ? a.hdrList : []);
+      const bTags = (Array.isArray(b?.visualTags) && b.visualTags.length)
+        ? b.visualTags : (Array.isArray(b?.hdrList) ? b.hdrList : []);
       const aIdx = getBestIndexFromList(aTags, preferredVisualTags);
       const bIdx = getBestIndexFromList(bTags, preferredVisualTags);
       const cmp = compareIndexes(aIdx, bIdx);
@@ -464,8 +462,11 @@ function compareByCustomChain(a, b, options = {}) {
     }
 
     if (criterion === 'audio_tag') {
-      const aTags = Array.isArray(a?.audioList) ? a.audioList : [];
-      const bTags = Array.isArray(b?.audioList) ? b.audioList : [];
+      // Canonical audioTags; fall back to raw audio list for old streams.
+      const aTags = (Array.isArray(a?.audioTags) && a.audioTags.length)
+        ? a.audioTags : (Array.isArray(a?.audioList) ? a.audioList : []);
+      const bTags = (Array.isArray(b?.audioTags) && b.audioTags.length)
+        ? b.audioTags : (Array.isArray(b?.audioList) ? b.audioList : []);
       const aIdx = getBestIndexFromList(aTags, preferredAudioTags);
       const bIdx = getBestIndexFromList(bTags, preferredAudioTags);
       const cmp = compareIndexes(aIdx, bIdx);
@@ -728,7 +729,7 @@ function isTriageFinalStatus(status) {
   return TRIAGE_FINAL_STATUSES.has(String(status).toLowerCase());
 }
 
-function buildStreamCacheKey({ type, id, query = {}, requestedEpisode = null }) {
+function buildStreamCacheKey({ type, id, query = {}, requestedEpisode = null, profileName = null }) {
   const normalizedQuery = {};
   Object.keys(query)
     .sort()
@@ -741,7 +742,10 @@ function buildStreamCacheKey({ type, id, query = {}, requestedEpisode = null }) 
       episode: Number.isFinite(requestedEpisode.episode) ? requestedEpisode.episode : null,
     }
     : null;
-  return JSON.stringify({ type, id, requestedEpisode: normalizedEpisode, query: normalizedQuery });
+  const payload = { type, id, requestedEpisode: normalizedEpisode, query: normalizedQuery };
+  // Appended last and only when set, so default (no-profile) keys stay byte-identical.
+  if (profileName) payload.profile = profileName;
+  return JSON.stringify(payload);
 }
 
 function restoreTriageDecisions(snapshot) {

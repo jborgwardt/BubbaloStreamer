@@ -29,6 +29,7 @@ const {
   AUDIO_CHANNEL_SYNONYMS,
   AUDIO_SYNONYMS,
   ENCODE_SYNONYMS,
+  QUALITY_SYNONYMS,
   RESOLUTION_SYNONYMS,
   LANGUAGE_SYNONYMS,
 } = require('./sortKeys');
@@ -145,11 +146,12 @@ function filterStreams(streams, filters = {}) {
   const ranges = filters.ranges || {};
 
   // Prebuild sets for cheap lookups. Dimensions with a synonym map use the
-  // synonym-aware builder so aliases match (matching the sort engine). Quality,
-  // release groups, and visual tags have no synonym map → plain lowerSet.
+  // synonym-aware builder so aliases match (matching the sort engine). Quality
+  // canonicalizes legacy aliases (e.g. bare "remux" → "bluray remux"). Release
+  // groups and visual tags have no synonym map → plain lowerSet.
   const excludedSets = {
     resolutions: lowerSetWithSynonyms(excluded.resolutions, RESOLUTION_SYNONYMS),
-    qualities: lowerSet(excluded.qualities),
+    qualities: lowerSetWithSynonyms(excluded.qualities, QUALITY_SYNONYMS),
     encodes: lowerSetWithSynonyms(excluded.encodes, ENCODE_SYNONYMS),
     releaseGroups: lowerSet(excluded.releaseGroups),
     visualTags: lowerSet(excluded.visualTags),
@@ -172,10 +174,11 @@ function filterStreams(streams, filters = {}) {
   return streams.filter((stream) => {
     if (!stream || typeof stream !== 'object') return false;
 
-    // Scalar excludes (resolution + encode are synonym-aware: '4k'≡'2160p',
-    // 'x264'≡'h.264'≡'avc'). Quality and release groups have no synonym map.
+    // Scalar excludes (resolution + encode + quality are synonym-aware:
+    // '4k'≡'2160p', 'x264'≡'h.264'≡'avc', 'remux'≡'bluray remux'). Release
+    // groups have no synonym map.
     if (scalarInSetWithSynonyms(getStreamResolution(stream), excludedSets.resolutions, RESOLUTION_SYNONYMS)) return false;
-    if (scalarInSet(getStreamQuality(stream), excludedSets.qualities)) return false;
+    if (scalarInSetWithSynonyms(getStreamQuality(stream), excludedSets.qualities, QUALITY_SYNONYMS)) return false;
     if (scalarInSetWithSynonyms(getStreamEncode(stream), excludedSets.encodes, ENCODE_SYNONYMS)) return false;
     if (scalarInSet(getStreamReleaseGroup(stream), excludedSets.releaseGroups)) return false;
 

@@ -217,6 +217,37 @@ function extractHydraAttrMap(item) {
   return attrMap;
 }
 
+// NZBHydra (and the newznab spec) report failures as an <error code= description=/>
+// body while STILL returning HTTP 200 — so a bad API key (code 100), suspended
+// account (101) or insufficient privileges (102) look like a normal response and
+// would otherwise be swallowed as "0 results". Detect that payload so callers can
+// surface it. Returns { code, description } or null. Handles the JSON shape NZBHydra
+// emits with o=json plus common parsed-XML variants.
+function extractNewznabError(data) {
+  if (!data || typeof data !== 'object') return null;
+  // Shape 1: an <error code= description=/> wrapper (parsed-XML variants).
+  let err = data.error ?? data.Error ?? data['newznab:error'] ?? null;
+  // Shape 2: NZBHydra with o=json puts the error at the TOP LEVEL, e.g.
+  //   { searchType: null, code: "100", description: "Wrong api key", ... }
+  // Treat top-level code+description as an error ONLY when there is no result
+  // payload (channel/rss/items), so a normal search response never false-matches.
+  if (!err && data.code != null && data.description != null
+      && !data.channel && !data.rss && !data.item) {
+    err = data;
+  }
+  if (!err) return null;
+  if (typeof err === 'string') return { code: null, description: err.trim() || 'Unknown error' };
+  const attrs = err['@attributes'] || err.attributes || err.$ || err;
+  const code = attrs.code ?? attrs.Code ?? attrs['@code'] ?? err.code ?? null;
+  const description = attrs.description ?? attrs.Description ?? attrs['@description']
+    ?? err.description ?? err['#text'] ?? null;
+  if (code == null && !description) return null;
+  return {
+    code: code != null ? String(code).trim() : null,
+    description: description ? String(description).trim() : 'Unknown error',
+  };
+}
+
 function normalizeHydraResults(data) {
   if (!data) return [];
 
@@ -365,6 +396,14 @@ async function executeNzbhydraSearch(plan) {
     proxy: false,
     ...(buildProxyAgents(INDEXER_MANAGER_PROXY, url) || {}),
   });
+  // NZBHydra returns HTTP 200 with a newznab <error> body on failures (e.g. a
+  // bad API key → code 100). Throw so the failure surfaces in the search log's
+  // `errors` (manager: …) instead of silently looking like 0 results.
+  const apiError = extractNewznabError(response.data);
+  if (apiError) {
+    const codePart = apiError.code ? ` (code ${apiError.code})` : '';
+    throw new Error(`NZBHydra: ${apiError.description}${codePart}`);
+  }
   return normalizeHydraResults(response.data);
 }
 
@@ -422,6 +461,7 @@ module.exports = {
   // Export for testing/direct use
   executeProwlarrSearch,
   executeNzbhydraSearch,
+  extractNewznabError,
   buildProwlarrSearchParams,
   buildHydraSearchParams,
   getManagerProxy,

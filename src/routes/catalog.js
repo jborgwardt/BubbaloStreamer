@@ -4,7 +4,12 @@ const { buildNzbdavMetas } = require('./buildNzbdavMeta');
 
 module.exports = function createCatalogHandler(getConfig) {
   return async function catalogHandler(req, res) {
-    const { STREAMING_MODE, NZBDAV_HISTORY_CATALOG_LIMIT, ADDON_BASE_URL } = getConfig();
+    const cfg = getConfig(req.profileName);
+    if (cfg.profileUnknown) {
+      res.status(404).json({ metas: [] });
+      return;
+    }
+    const { STREAMING_MODE, NZBDAV_HISTORY_CATALOG_LIMIT, ADDON_BASE_URL } = cfg;
 
     if (STREAMING_MODE === 'native' || NZBDAV_HISTORY_CATALOG_LIMIT <= 0) {
       res.status(404).json({ metas: [] });

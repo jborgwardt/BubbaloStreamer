@@ -84,6 +84,7 @@ const animeDatabase = require('./src/services/animeDatabase');
 const autoAdvanceQueue = require('./src/services/autoAdvanceQueue');
 const backgroundTriage = require('./src/services/backgroundTriage');
 const diskNzbCache = require('./src/cache/diskNzbCache');
+const profileManager = require('./src/services/profileManager');
 
 // Periodic janitor — prune caches + sessions on a timer so RAM/disk stay
 // bounded without relying on an admin config-save. unref() so it never keeps
@@ -217,8 +218,12 @@ const adminStatic = express.static(path.join(__dirname, 'admin'), {
   },
 });
 
-// Keys that cannot be changed via the admin API — only via env/docker/filesystem
-const FROZEN_KEYS = new Set(['ADDON_SHARED_SECRET', 'STREAMING_MODE']);
+// Keys that cannot be changed via the admin API — only via env/docker/filesystem.
+// STREAMING_MODE used to be here (frozen because native mode exposes raw indexer
+// links to Stremio); it's now editable from the UI and applies on save via
+// rebuildRuntimeConfig() — no restart needed. The native-mode tradeoff is surfaced
+// as a UI warning instead of a hard freeze.
+const FROZEN_KEYS = new Set(['ADDON_SHARED_SECRET']);
 
 adminApiRouter.get('/config', (req, res) => {
   const values = collectConfigValues(ADMIN_CONFIG_KEYS);
@@ -352,6 +357,16 @@ adminApiRouter.post('/config', async (req, res) => {
       } else {
         updates[key] = String(value);
       }
+      // Clearing a proxy must actually REMOVE it. An empty string would be
+      // skipped by applyRuntimeEnv (which deliberately won't overwrite a
+      // non-empty process.env value with '', to protect Docker/.env config), so
+      // a cleared proxy would otherwise only take effect on restart. Deleting
+      // the key unsets it live — while a value supplied solely via Docker/.env
+      // is preserved (it was never an applied runtime-env key). Per-row
+      // NEWZNAB_PROXY_<NN> already null-deletes via the numbered-key path above.
+      if (/(^|_)PROXY$/.test(key) && updates[key] === '') {
+        updates[key] = null;
+      }
     }
   });
 
@@ -385,7 +400,12 @@ adminApiRouter.post('/config', async (req, res) => {
     runtimeEnv.updateRuntimeEnv(updates);
     runtimeEnv.applyRuntimeEnv();
 
-    const newznabConfigsForCaps = newznabService.getNewznabConfigsFromValues(incoming, { includeEmpty: false });
+    // Use unsentineled values: `incoming` still has masked sentinels for credential
+    // fields (API keys + credential-bearing proxy URLs). applyRuntimeEnv() above
+    // restored the real values to process.env, so unsentinelValues swaps the sentinels
+    // back — otherwise the caps fetch would use the sentinel as the proxy URL
+    // ("Invalid proxy URL") and as the API key (silent caps failure → defaults).
+    const newznabConfigsForCaps = newznabService.getNewznabConfigsFromValues(unsentinelValues(incoming), { includeEmpty: false });
     try {
       const capsCache = await newznabService.refreshCapsCache(newznabConfigsForCaps, { timeoutMs: 12000 });
       console.log('[NEWZNAB][CAPS] Saved caps cache', capsCache);
@@ -423,6 +443,102 @@ adminApiRouter.post('/config', async (req, res) => {
   } catch (error) {
     console.error('[ADMIN] Failed to update configuration', error);
     res.status(500).json({ error: 'Failed to persist configuration changes' });
+  }
+});
+
+// ── Profile CRUD ────────────────────────────────────────────────────────────
+// Profiles are stored as flat NZB_PROFILE_<NN>_<FIELD> keys in runtime-env.json
+// (same storage as everything else — no new file). These endpoints read/write only
+// ACTIVE slots, so responses stay small. Profile config is read live per request via
+// getEffectiveConfig(process.env), so applyRuntimeEnv() is enough — no rebuild needed.
+function findFreeProfileSlot(source = process.env) {
+  const used = new Set(Array.from(profileManager.getProfiles(source).values()).map((p) => parseInt(p.slot, 10)));
+  for (let i = 1; i <= profileManager.MAX_PROFILES; i += 1) {
+    if (!used.has(i)) return i;
+  }
+  return null;
+}
+
+adminApiRouter.get('/profiles', (req, res) => {
+  res.json({
+    profiles: Array.from(profileManager.getProfiles().values()),
+    maxProfiles: profileManager.MAX_PROFILES,
+    fields: Object.keys(profileManager.PROFILE_OVERRIDES),
+    // suffix -> global env key (= the admin form field name). The UI uses this to map
+    // a profile's overrides onto the existing form fields, and back on save.
+    overrideMap: profileManager.PROFILE_OVERRIDES,
+  });
+});
+
+adminApiRouter.post('/profiles', (req, res) => {
+  const body = req.body || {};
+  const rawName = typeof body.name === 'string' ? body.name.trim() : '';
+  const newSlug = profileManager.slugifyProfileName(rawName);
+  if (!rawName || !newSlug || !profileManager.isValidProfileName(newSlug)) {
+    res.status(400).json({ error: 'Invalid profile name. Use letters, numbers, spaces, _ or - (not a reserved word like "admin" or "stream").' });
+    return;
+  }
+  const profiles = profileManager.getProfiles();
+  const editingSlug = typeof body.slug === 'string' ? profileManager.slugifyProfileName(body.slug) : '';
+  const editing = editingSlug ? profiles.get(editingSlug) : null;
+
+  // Reject if the new slug collides with a DIFFERENT existing profile.
+  const collision = profiles.get(newSlug);
+  if (collision && (!editing || collision.slot !== editing.slot)) {
+    res.status(409).json({ error: `A profile "${newSlug}" already exists.` });
+    return;
+  }
+
+  let slotNum;
+  if (editing) {
+    slotNum = parseInt(editing.slot, 10);
+  } else {
+    slotNum = findFreeProfileSlot();
+    if (!slotNum) {
+      res.status(409).json({ error: `Maximum of ${profileManager.MAX_PROFILES} profiles reached.` });
+      return;
+    }
+  }
+  const idx = String(slotNum).padStart(2, '0');
+
+  // Whitelist: only known override suffixes; empty/missing -> null (clear = inherit).
+  const incomingOverrides = (body.overrides && typeof body.overrides === 'object') ? body.overrides : {};
+  const updates = { [`NZB_PROFILE_${idx}_NAME`]: rawName };
+  Object.keys(profileManager.PROFILE_OVERRIDES).forEach((suffix) => {
+    const v = incomingOverrides[suffix];
+    const trimmed = typeof v === 'string' ? v.trim() : v;
+    updates[`NZB_PROFILE_${idx}_${suffix}`] = (trimmed === '' || trimmed === null || trimmed === undefined) ? null : String(trimmed);
+  });
+
+  try {
+    runtimeEnv.updateRuntimeEnv(updates);
+    runtimeEnv.applyRuntimeEnv();
+    res.json({ success: true, profile: profileManager.getProfiles().get(newSlug) || null });
+  } catch (error) {
+    console.error('[ADMIN] Failed to save profile', error);
+    res.status(500).json({ error: 'Failed to persist profile' });
+  }
+});
+
+adminApiRouter.delete('/profiles/:slug', (req, res) => {
+  const slug = profileManager.slugifyProfileName(req.params.slug || '');
+  const profile = profileManager.getProfiles().get(slug);
+  if (!profile) {
+    res.status(404).json({ error: 'Profile not found' });
+    return;
+  }
+  const idx = profile.slot;
+  const updates = { [`NZB_PROFILE_${idx}_NAME`]: null };
+  Object.keys(profileManager.PROFILE_OVERRIDES).forEach((suffix) => {
+    updates[`NZB_PROFILE_${idx}_${suffix}`] = null;
+  });
+  try {
+    runtimeEnv.updateRuntimeEnv(updates);
+    runtimeEnv.applyRuntimeEnv();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[ADMIN] Failed to delete profile', error);
+    res.status(500).json({ error: 'Failed to delete profile' });
   }
 });
 
@@ -511,6 +627,33 @@ app.get('/', (req, res) => {
 // Serve shared utilities to frontend
 app.get('/utils/templateEngine.js', (req, res) => {
   res.sendFile(path.join(__dirname, 'src/utils/templateEngine.js'));
+});
+
+// Multi-profile routing: a request like /<token>/<profile>/<resource>... carries a
+// profile name in the 2nd path segment (detected by the 3rd segment being a Stremio
+// resource word). Validate it, stash req.profileName, and rewrite the URL to the
+// normal /<token>/<resource>... form so the existing routes + the token guard below
+// match unchanged. Default 2-segment URLs are untouched.
+// Phase 1: the profile is parsed but not yet applied (behaves identically to default).
+const PROFILE_RESOURCE_WORDS = new Set(['manifest.json', 'stream', 'meta', 'catalog', 'subtitles', 'nzb', 'easynews']);
+app.use((req, res, next) => {
+  const parts = req.path.split('/').filter(Boolean);
+  if (parts.length >= 3
+      && parts[0] !== 'admin' && parts[0] !== 'assets'
+      && PROFILE_RESOURCE_WORDS.has(parts[2].toLowerCase())) {
+    const profile = parts[1];
+    // Only treat this as a profile request when parts[1] is a valid profile name.
+    // A reserved word here must fall through to its normal route, NOT 404 — e.g.
+    // /<token>/nzb/stream (parts[2]='stream' is a resource word, but parts[1]='nzb'
+    // is the nzb subsystem) and /<token>/easynews/nzb. Unknown-but-valid-format names
+    // still set req.profileName and get 404'd downstream by the resource handlers.
+    if (profileManager.isValidProfileName(profile)) {
+      req.profileName = profile;
+      const qs = req.url.slice(req.path.length); // preserve any ?query
+      req.url = `/${[parts[0], ...parts.slice(2)].join('/')}${qs}`;
+    }
+  }
+  next();
 });
 
 app.use((req, res, next) => {
@@ -657,6 +800,41 @@ let AUTO_ADVANCE_BACKUP_COUNT = 0;
 let NZB_STREAM_PROTECTION = (process.env.NZB_STREAM_PROTECTION || '').trim().toLowerCase();
 let TRIAGE_MODE = 'disabled';
 
+// PURE: map a protection mode (+ auto-advance strategy + legacy fallbacks) to
+// the derived triage/auto-advance settings, WITHOUT touching any global. This
+// is the per-profile-ready core; the wrapper below preserves today's behavior.
+// `forcePrefetchOff` is true only for 'none' (matching the original, which only
+// ever forced TRIAGE_PREFETCH_FIRST_VERIFIED=false in the 'none' branch).
+function deriveProtection(protection, strategy, legacy = {}) {
+  const backupCount = strategy === 'prequeue' ? 1 : 0;
+  switch (protection) {
+    case 'none':
+      return { triageEnabled: false, triageMode: 'disabled', autoAdvanceEnabled: false, backupCount, forcePrefetchOff: true };
+    case 'auto-advance':
+      return { triageEnabled: false, triageMode: 'disabled', autoAdvanceEnabled: true, backupCount };
+    case 'health-check':
+      return { triageEnabled: true, triageMode: 'blocking', autoAdvanceEnabled: false, backupCount };
+    case 'health-check-auto-advance':
+      return { triageEnabled: true, triageMode: 'blocking', autoAdvanceEnabled: true, backupCount };
+    case 'smart-play-only':
+      return { triageEnabled: true, triageMode: 'background', autoAdvanceEnabled: false, backupCount };
+    case 'smart-play':
+      return { triageEnabled: true, triageMode: 'background', autoAdvanceEnabled: true, backupCount };
+    default: {
+      // Backward compat: derive from legacy NZB_TRIAGE_ENABLED / NZB_TRIAGE_MODE.
+      const triageEnabled = toBoolean(legacy.triageEnabled, false);
+      if (!triageEnabled) {
+        return { triageEnabled: false, triageMode: 'disabled', autoAdvanceEnabled: true, backupCount };
+      }
+      const rawMode = (legacy.triageMode || '').trim().toLowerCase();
+      const triageMode = ['blocking', 'background', 'disabled'].includes(rawMode) ? rawMode : 'blocking';
+      return { triageEnabled, triageMode, autoAdvanceEnabled: triageMode === 'background', backupCount };
+    }
+  }
+}
+
+// Wrapper: reads env + assigns the module globals exactly as before (used at
+// startup/rebuild). Behavior is identical to the previous inline switch.
 function deriveStreamProtection() {
   const protection = (process.env.NZB_STREAM_PROTECTION || '').trim().toLowerCase();
   const strategy = (process.env.NZB_AUTO_ADVANCE_STRATEGY || 'on-demand').trim().toLowerCase();
@@ -665,44 +843,15 @@ function deriveStreamProtection() {
   // Auto-advance strategy (only matters when auto-advance is enabled):
   //   on-demand (default): backupCount=0 → queue 1 at a time on user click
   //   prequeue:            backupCount=1 → keep 1+1 ready once activated
-  // Sessions always start idle — nothing queued until user clicks or pre-cache triggers.
-  AUTO_ADVANCE_BACKUP_COUNT = strategy === 'prequeue' ? 1 : 0;
-
-  switch (protection) {
-    case 'none':
-      TRIAGE_ENABLED = false; TRIAGE_MODE = 'disabled'; AUTO_ADVANCE_ENABLED = false;
-      TRIAGE_PREFETCH_FIRST_VERIFIED = false; // no protection = no prefetch
-      break;
-    case 'auto-advance':
-      TRIAGE_ENABLED = false; TRIAGE_MODE = 'disabled'; AUTO_ADVANCE_ENABLED = true;
-      break;
-    case 'health-check':
-      TRIAGE_ENABLED = true; TRIAGE_MODE = 'blocking'; AUTO_ADVANCE_ENABLED = false;
-      break;
-    case 'health-check-auto-advance':
-      TRIAGE_ENABLED = true; TRIAGE_MODE = 'blocking'; AUTO_ADVANCE_ENABLED = true;
-      break;
-    case 'smart-play-only':
-      TRIAGE_ENABLED = true; TRIAGE_MODE = 'background'; AUTO_ADVANCE_ENABLED = false;
-      // Prefetch is user-controlled — not forced for smart-play modes
-      break;
-    case 'smart-play':
-      TRIAGE_ENABLED = true; TRIAGE_MODE = 'background'; AUTO_ADVANCE_ENABLED = true;
-      // Prefetch is user-controlled — not forced for smart-play modes
-      break;
-    default:
-      // Backward compat: derive from legacy NZB_TRIAGE_ENABLED / NZB_TRIAGE_MODE.
-      // Triage disabled (or unset) → auto-advance (no health checks, runtime failover).
-      TRIAGE_ENABLED = toBoolean(process.env.NZB_TRIAGE_ENABLED, false);
-      if (!TRIAGE_ENABLED) {
-        TRIAGE_MODE = 'disabled'; AUTO_ADVANCE_ENABLED = true;
-        break;
-      }
-      const rawMode = (process.env.NZB_TRIAGE_MODE || '').trim().toLowerCase();
-      TRIAGE_MODE = ['blocking', 'background', 'disabled'].includes(rawMode) ? rawMode : 'blocking';
-      AUTO_ADVANCE_ENABLED = TRIAGE_MODE === 'background';
-      break;
-  }
+  const d = deriveProtection(protection, strategy, {
+    triageEnabled: process.env.NZB_TRIAGE_ENABLED,
+    triageMode: process.env.NZB_TRIAGE_MODE,
+  });
+  AUTO_ADVANCE_BACKUP_COUNT = d.backupCount;
+  TRIAGE_ENABLED = d.triageEnabled;
+  TRIAGE_MODE = d.triageMode;
+  AUTO_ADVANCE_ENABLED = d.autoAdvanceEnabled;
+  if (d.forcePrefetchOff) TRIAGE_PREFETCH_FIRST_VERIFIED = false; // no protection = no prefetch
 }
 let TRIAGE_TIME_BUDGET_MS = toPositiveInt(process.env.NZB_TRIAGE_TIME_BUDGET_MS, 25000);
 let TRIAGE_MAX_CANDIDATES = toPositiveInt(process.env.NZB_TRIAGE_MAX_CANDIDATES, 25);
@@ -722,6 +871,31 @@ let TRIAGE_NNTP_KEEP_ALIVE_MS = toPositiveInt(process.env.NZB_TRIAGE_NNTP_KEEP_A
 let TRIAGE_PREFETCH_FIRST_VERIFIED = toBoolean(process.env.NZB_TRIAGE_PREFETCH_FIRST_VERIFIED, true);
 let SMART_PLAY_MODE = (process.env.NZB_SMART_PLAY_MODE || 'fastest').trim().toLowerCase() === 'top-ranked' ? 'top-ranked' : 'fastest';
 deriveStreamProtection(); // must run AFTER TRIAGE_PREFETCH_FIRST_VERIFIED is declared (overrides for none/smart-play)
+
+// Per-request protection switches for a given effective config (or the globals when
+// profileEff is null). Mirrors deriveStreamProtection's mapping WITHOUT mutating any
+// global, so a profile's protection mode applies consistently to the streams the
+// handler builds AND the playback callbacks they invoke. Strategy + legacy triage
+// fallbacks stay global (only the protection mode is per-profile); the triage engine,
+// pool, pre-warm, and NZB_TRIAGE_* tuning are untouched.
+function resolveRequestProtection(profileEff) {
+  if (!profileEff) {
+    return {
+      triageEnabled: TRIAGE_ENABLED, triageMode: TRIAGE_MODE,
+      autoAdvanceEnabled: AUTO_ADVANCE_ENABLED, backupCount: AUTO_ADVANCE_BACKUP_COUNT,
+      prefetchFirstVerified: TRIAGE_PREFETCH_FIRST_VERIFIED,
+    };
+  }
+  const d = deriveProtection(
+    (profileEff.config.NZB_STREAM_PROTECTION || '').trim().toLowerCase(),
+    (process.env.NZB_AUTO_ADVANCE_STRATEGY || 'on-demand').trim().toLowerCase(),
+    { triageEnabled: process.env.NZB_TRIAGE_ENABLED, triageMode: process.env.NZB_TRIAGE_MODE });
+  return {
+    triageEnabled: d.triageEnabled, triageMode: d.triageMode,
+    autoAdvanceEnabled: d.autoAdvanceEnabled, backupCount: d.backupCount,
+    prefetchFirstVerified: d.forcePrefetchOff ? false : TRIAGE_PREFETCH_FIRST_VERIFIED,
+  };
+}
 
 let TRIAGE_BASE_OPTIONS = {
   maxDecodedBytes: TRIAGE_MAX_DECODED_BYTES,
@@ -788,8 +962,29 @@ function buildSharedPoolOptions() {
 const MAX_NEWZNAB_INDEXERS = newznabService.MAX_NEWZNAB_INDEXERS;
 const NEWZNAB_NUMBERED_KEYS = newznabService.NEWZNAB_NUMBERED_KEYS;
 
+// True if any saved profile selects a protection mode that enables triage
+// (health-check / smart-play variants). A profile with no STREAM_PROTECTION
+// override inherits the default and is already covered by the global
+// TRIAGE_ENABLED check. Lets the startup pre-warm build the shared NNTP pool
+// even when the DEFAULT profile has triage off, so a request to a health-check
+// profile finds a warm pool instead of building one cold inside triage.
+function anyProfileEnablesTriage() {
+  try {
+    const strategy = (process.env.NZB_AUTO_ADVANCE_STRATEGY || 'on-demand').trim().toLowerCase();
+    const legacy = { triageEnabled: process.env.NZB_TRIAGE_ENABLED, triageMode: process.env.NZB_TRIAGE_MODE };
+    for (const profile of profileManager.getProfiles().values()) {
+      const protection = (profile.overrides?.STREAM_PROTECTION || '').trim().toLowerCase();
+      if (!protection) continue; // inherits default → covered by global TRIAGE_ENABLED
+      if (deriveProtection(protection, strategy, legacy).triageEnabled) return true;
+    }
+  } catch (err) {
+    console.warn('[NZB TRIAGE] Profile triage pre-warm scan failed', err?.message || err);
+  }
+  return false;
+}
+
 function maybePrewarmSharedNntpPool() {
-  if (!TRIAGE_ENABLED || !TRIAGE_REUSE_POOL || !TRIAGE_NNTP_CONFIG) {
+  if ((!TRIAGE_ENABLED && !anyProfileEnablesTriage()) || !TRIAGE_REUSE_POOL || !TRIAGE_NNTP_CONFIG) {
     return;
   }
   const options = buildSharedPoolOptions();
@@ -803,8 +998,12 @@ function maybePrewarmSharedNntpPool() {
     });
 }
 
-function triggerRequestTriagePrewarm(reason = 'request') {
-  if (!TRIAGE_ENABLED || !TRIAGE_REUSE_POOL || !TRIAGE_NNTP_CONFIG) {
+function triggerRequestTriagePrewarm(reason = 'request', triageEnabled = TRIAGE_ENABLED) {
+  // Gate on the EFFECTIVE (per-request) triage flag, not the global default-profile
+  // one. This lets a request to a health-check profile pre-warm the shared NNTP
+  // pool even when the DEFAULT profile has triage off — otherwise the pool would
+  // be built cold inside triage on that request, adding seconds of latency.
+  if (!triageEnabled || !TRIAGE_REUSE_POOL || !TRIAGE_NNTP_CONFIG) {
     return null;
   }
   const options = buildSharedPoolOptions();
@@ -852,8 +1051,12 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   ADDON_NAME = (process.env.ADDON_NAME || DEFAULT_ADDON_NAME).trim() || DEFAULT_ADDON_NAME;
 
   INDEXER_MANAGER = (process.env.INDEXER_MANAGER || 'none').trim().toLowerCase();
-  // Force newznab-only in native streaming mode
-  if (STREAMING_MODE === 'native') INDEXER_MANAGER = 'none';
+  // Native mode forces newznab-only ONLY when the addon is on plain HTTP. On HTTP,
+  // native must hand Stremio the indexer's direct HTTPS link (Stremio refuses HTTP
+  // addon URLs) and manager (Prowlarr) links are usually local/HTTP — hence
+  // newznab-only. On HTTPS, native serves NZBs via the addon (encrypted), so any
+  // indexer works and the constraint is lifted.
+  if (STREAMING_MODE === 'native' && !/^https:/i.test(ADDON_BASE_URL)) INDEXER_MANAGER = 'none';
   INDEXER_MANAGER_URL = (process.env.INDEXER_MANAGER_URL || process.env.PROWLARR_URL || '').trim();
   INDEXER_MANAGER_API_KEY = (process.env.INDEXER_MANAGER_API_KEY || process.env.PROWLARR_API_KEY || '').trim();
   INDEXER_MANAGER_LABEL = INDEXER_MANAGER === 'nzbhydra'
@@ -1090,8 +1293,8 @@ ADMIN_CONFIG_KEYS.push(
   'NZB_AIO_SORT_CONFIG',
 );
 
-function executeManagerPlanWithBackoff(plan) {
-  if (INDEXER_MANAGER === 'none') {
+function executeManagerPlanWithBackoff(plan, skipManager = false) {
+  if (skipManager || INDEXER_MANAGER === 'none') {
     return Promise.resolve({ results: [] });
   }
   if (plan.skipHydra && INDEXER_MANAGER === 'nzbhydra') {
@@ -1262,14 +1465,31 @@ const VIDEO_MIME_MAP = new Map([
 ]);
 
 // Route handlers created from extracted factory modules
-function getRouteConfig() {
-  return {
+function getRouteConfig(profileName) {
+  const base = {
     STREAMING_MODE,
     ADDON_NAME,
     DEFAULT_ADDON_NAME,
     ADDON_BASE_URL,
     ADDON_VERSION,
     NZBDAV_HISTORY_CATALOG_LIMIT,
+  };
+  // No profile (default profile) → exact current behavior, byte-identical.
+  if (!profileName) return base;
+  const eff = profileManager.getEffectiveConfig(profileName);
+  if (!eff) return { ...base, profileUnknown: true };
+  const ov = eff.profile.overrides;
+  const catalogOverride = ov.CATALOG_LIMIT;
+  return {
+    ...base,
+    STREAMING_MODE: eff.config.STREAMING_MODE || base.STREAMING_MODE,
+    ADDON_NAME: (ov.ADDON_NAME && ov.ADDON_NAME.trim()) ? ov.ADDON_NAME.trim() : base.ADDON_NAME,
+    NZBDAV_HISTORY_CATALOG_LIMIT: (catalogOverride != null && String(catalogOverride).trim() !== '')
+      ? (Number(catalogOverride) || 0)
+      : base.NZBDAV_HISTORY_CATALOG_LIMIT,
+    profileSlug: eff.profile.slug,
+    profileDisplayName: eff.profile.name,
+    profileNameOverridden: Boolean(ov.ADDON_NAME && ov.ADDON_NAME.trim()),
   };
 }
 
@@ -1293,7 +1513,43 @@ const handleEasynewsNzbDownload = createEasynewsHandler(getRouteConfig);
 async function streamHandler(req, res) {
   const requestStartTs = Date.now();
   const { type, id } = req.params;
-  const contentKey = `${type}:${id}`;
+  // Scope sessions by profile so two profiles never share auto-advance/triage
+  // candidate lists. Travels in the callback URL query (read back by the
+  // smartplay/nzb handlers), so downstream lookups resolve the right session.
+  const contentKey = req.profileName ? `${type}:${id}:${req.profileName}` : `${type}:${id}`;
+  // Resolve this request's effective per-profile config (null = default profile).
+  // A valid-format but unknown profile is a 404, matching the manifest behavior.
+  const profileEff = req.profileName ? profileManager.getEffectiveConfig(req.profileName) : null;
+  if (req.profileName && !profileEff) {
+    res.status(404).json({ streams: [] });
+    return;
+  }
+  // Per-profile sort/filter/dedup source: overlay this profile's overrides onto
+  // global env. For the default profile (profileEff null) this IS process.env, so
+  // every derivation below stays byte-identical to today.
+  const sortSource = profileEff ? { ...process.env, ...profileEff.config } : process.env;
+  // Per-profile stream protection: deriveProtection() maps the profile's protection
+  // MODE to the same {triage, auto-advance} switches the global wrapper sets at
+  // startup. We only read these per-request switches per profile — the triage engine,
+  // pool, pre-warm, and all NZB_TRIAGE_* tuning stay global and untouched. Strategy +
+  // legacy triage fallbacks also stay global (only the protection mode is per-profile).
+  // Default profile (profileEff null) reuses the existing globals -> byte-identical.
+  const effProtection = resolveRequestProtection(profileEff);
+  const effTriageEnabled = effProtection.triageEnabled;
+  const effTriageMode = effProtection.triageMode;
+  const effAutoAdvanceEnabled = effProtection.autoAdvanceEnabled;
+  const effAutoAdvanceBackupCount = effProtection.backupCount;
+  const effPrefetchFirstVerified = effProtection.prefetchFirstVerified;
+  // Per-profile streaming mode (native vs nzbdav). Default profile uses the global
+  // STREAMING_MODE -> byte-identical. Drives native-vs-nzbdav stream building + the
+  // nzbdav-only feature guards below. getEffectiveConfig already resolved the profile's
+  // mode (or inherited the default).
+  const effStreamingMode = profileEff ? profileEff.config.STREAMING_MODE : STREAMING_MODE;
+  // A native profile on a plain-HTTP addon must be newznab-only (direct indexer HTTPS
+  // links — manager links are usually local/HTTP and unplayable). On HTTPS, native serves
+  // via the /nzb/fetch proxy so the manager is fine. nzbdav profiles + the default are
+  // unaffected (false — the instance INDEXER_MANAGER already reflects native-instance HTTP).
+  const effSkipManager = effStreamingMode === 'native' && !/^https:/i.test(ADDON_BASE_URL) && INDEXER_MANAGER !== 'none';
   console.log(`[REQUEST] Received request for ${type} ID: ${id}`, { ts: new Date(requestStartTs).toISOString() });
   let triagePrewarmPromise = null;
 
@@ -1381,10 +1637,10 @@ async function streamHandler(req, res) {
       indexerService.ensureIndexerManagerConfigured();
     }
     // Skip NZBDav config check in native streaming mode
-    if (STREAMING_MODE !== 'native') {
+    if (effStreamingMode !== 'native') {
       nzbdavService.ensureNzbdavConfigured();
     }
-    triagePrewarmPromise = triggerRequestTriagePrewarm();
+    triagePrewarmPromise = triggerRequestTriagePrewarm('request', effTriageEnabled);
 
     if (incomingTmdbId && !incomingImdbId && !incomingTvdbId) {
       if (!tmdbService.isConfigured()) {
@@ -1451,7 +1707,7 @@ async function streamHandler(req, res) {
     }
 
     if (isNzbdavRequest) {
-      if (STREAMING_MODE === 'native') {
+      if (effStreamingMode === 'native') {
         res.status(400).json({ error: 'NZBDav catalog is only available in NZBDav mode.' });
         return;
       }
@@ -1465,6 +1721,10 @@ async function streamHandler(req, res) {
       }
 
       const tokenSegment = ADDON_STREAM_TOKEN ? `/${ADDON_STREAM_TOKEN}` : '';
+      // Carry the active profile as a URL segment so the callback (stripped by the
+      // profile middleware) resolves the same profile's effective config. Empty for
+      // the default profile -> byte-identical URLs for existing installs.
+      const profileSegment = req.profileName ? `/${req.profileName}` : '';
       const rawFilename = (match.jobName || 'stream').toString().trim();
       const normalizedFilename = rawFilename
         .replace(/[\\/:*?"<>|]+/g, ' ')
@@ -1481,7 +1741,7 @@ async function streamHandler(req, res) {
       });
       if (match.jobName) baseParams.set('historyJobName', match.jobName);
       if (match.category) baseParams.set('historyCategory', match.category);
-      const streamUrl = `${addonBaseUrl}${tokenSegment}/nzb/stream/${encodeStreamParams(baseParams)}/${encodedFilename}`;
+      const streamUrl = `${addonBaseUrl}${tokenSegment}${profileSegment}/nzb/stream/${encodeStreamParams(baseParams)}/${encodedFilename}`;
 
       const stream = {
         title: match.jobName || 'NZBDav Completed',
@@ -1516,7 +1776,7 @@ async function streamHandler(req, res) {
     }
 
     const streamCacheKey = STREAM_CACHE_MAX_ENTRIES > 0
-      ? buildStreamCacheKey({ type, id, requestedEpisode, query: req.query || {} })
+      ? buildStreamCacheKey({ type, id, requestedEpisode, query: req.query || {}, profileName: req.profileName })
       : null;
     let cachedStreamEntry = null;
     let cachedSearchMeta = null;
@@ -1590,7 +1850,7 @@ async function streamHandler(req, res) {
     // subsequent opens when the user had dedupe disabled and a per-quality cap on.
     const triageOverrides = extractTriageOverrides(req.query || {});
     const dedupeBooleanOverride = typeof triageOverrides.dedupeEnabled === 'boolean' ? triageOverrides.dedupeEnabled : null;
-    const dedupeMode = dedupeBooleanOverride === false ? 'off' : INDEXER_DEDUP_MODE;
+    const dedupeMode = dedupeBooleanOverride === false ? 'off' : (profileEff ? resolveDedupeMode(sortSource) : INDEXER_DEDUP_MODE);
     const dedupeEnabled = dedupeMode !== 'off';
     if (cachedSearchMeta) {
       const restored = restoreFinalNzbResults(cachedSearchMeta.finalNzbResults);
@@ -1945,7 +2205,7 @@ async function streamHandler(req, res) {
           console.log(`${INDEXER_LOG_PREFIX} Dispatching early ID plan`, plan);
           const planStartTs = Date.now();
           return Promise.allSettled([
-            executeManagerPlanWithBackoff(plan),
+            executeManagerPlanWithBackoff(plan, effSkipManager),
             executeNewznabPlan(plan),
           ]).then((settled) => ({ plan, settled, startTs: planStartTs, endTs: Date.now() }));
         }));
@@ -2014,7 +2274,7 @@ async function streamHandler(req, res) {
             console.log(`${INDEXER_LOG_PREFIX} Added Cinemeta TVDB ID plan`, { tvdb: metaIds.tvdb });
             const planStartTs = Date.now();
             idSearchPromises.push(Promise.allSettled([
-              executeManagerPlanWithBackoff(searchPlans[searchPlans.length - 1]),
+              executeManagerPlanWithBackoff(searchPlans[searchPlans.length - 1], effSkipManager),
               executeNewznabPlan(searchPlans[searchPlans.length - 1]),
             ]).then((settled) => ({
               plan: searchPlans[searchPlans.length - 1],
@@ -2546,7 +2806,7 @@ async function streamHandler(req, res) {
       const planExecutions = remainingPlans.map((plan) => {
         console.log(`${INDEXER_LOG_PREFIX} Dispatching plan`, plan);
         return Promise.allSettled([
-          executeManagerPlanWithBackoff(plan),
+          executeManagerPlanWithBackoff(plan, effSkipManager),
           executeNewznabPlan(plan),
         ]).then((settled) => {
           const managerSet = settled[0];
@@ -2749,9 +3009,19 @@ async function streamHandler(req, res) {
       console.log(`${INDEXER_LOG_PREFIX} Final NZB selection: ${finalNzbResults.length} results`, { elapsedMs: Date.now() - requestStartTs });
     }
 
+    // The sort/filter module globals the block reads directly are re-derived here
+    // into eff* locals from sortSource (declared near the top of the handler) with
+    // the same parsers; buildConfigFromLegacy(sortSource) handles sort + preferred.
+    const effAllowedResolutions = profileEff ? parseAllowedResolutionList(sortSource.NZB_ALLOWED_RESOLUTIONS) : ALLOWED_RESOLUTIONS;
+    const effReleaseExclusions = profileEff ? parseCommaList(sortSource.NZB_RELEASE_EXCLUSIONS) : RELEASE_EXCLUSIONS;
+    const effPreferredKeywords = profileEff ? parseCommaList(sortSource.NZB_PREFERRED_KEYWORDS) : INDEXER_PREFERRED_KEYWORDS;
+    const effResolutionLimit = profileEff ? parseResolutionLimitValue(sortSource.NZB_RESOLUTION_LIMIT_PER_QUALITY) : RESOLUTION_LIMIT_PER_QUALITY;
+
     const effectiveMaxSizeBytes = (() => {
       const overrideBytes = triageOverrides.maxSizeBytes;
-      const defaultBytes = INDEXER_MAX_RESULT_SIZE_BYTES;
+      const defaultBytes = profileEff
+        ? toSizeBytesFromGb((sortSource.NZB_MAX_RESULT_SIZE_GB && sortSource.NZB_MAX_RESULT_SIZE_GB !== '') ? sortSource.NZB_MAX_RESULT_SIZE_GB : DEFAULT_MAX_RESULT_SIZE_GB)
+        : INDEXER_MAX_RESULT_SIZE_BYTES;
       const normalizedOverride = Number.isFinite(overrideBytes) && overrideBytes > 0 ? overrideBytes : null;
       const normalizedDefault = Number.isFinite(defaultBytes) && defaultBytes > 0 ? defaultBytes : null;
       if (normalizedOverride && normalizedDefault) {
@@ -2759,9 +3029,11 @@ async function streamHandler(req, res) {
       }
       return normalizedOverride || normalizedDefault || null;
     })();
-    const resolvedPreferredLanguages = resolvePreferredLanguages(triageOverrides.preferredLanguages, INDEXER_PREFERRED_LANGUAGES);
-    const activeSortMode = triageOverrides.sortMode || INDEXER_SORT_MODE;
-    const resolvedSortOrder = INDEXER_SORT_ORDER;
+    const effPreferredLanguagesBase = profileEff ? resolvePreferredLanguages(sortSource.NZB_PREFERRED_LANGUAGE, []) : INDEXER_PREFERRED_LANGUAGES;
+    const resolvedPreferredLanguages = resolvePreferredLanguages(triageOverrides.preferredLanguages, effPreferredLanguagesBase);
+    const effSortModeBase = profileEff ? normalizeSortMode(sortSource.NZB_SORT_MODE, 'quality_then_size') : INDEXER_SORT_MODE;
+    const activeSortMode = triageOverrides.sortMode || effSortModeBase;
+    const resolvedSortOrder = profileEff ? deriveSortOrder(sortSource.NZB_SORT_ORDER, effSortModeBase) : INDEXER_SORT_ORDER;
     const effectiveSortMode = resolvedSortOrder.length > 0 ? 'custom_priority' : activeSortMode;
 
     // Pass the title's original-production language so annotation can tag
@@ -2788,7 +3060,7 @@ async function streamHandler(req, res) {
       const { precomputeMatches } = require('./src/services/sort/precompute');
 
       let unified;
-      const rawConfig = (process.env.NZB_AIO_SORT_CONFIG || '').trim();
+      const rawConfig = (sortSource.NZB_AIO_SORT_CONFIG || '').trim();
       if (rawConfig) {
         const imported = importAioConfig(rawConfig);
         unified = {
@@ -2799,15 +3071,15 @@ async function streamHandler(req, res) {
           source: 'imported',
         };
       } else {
-        const legacy = buildConfigFromLegacy(process.env);
+        const legacy = buildConfigFromLegacy(sortSource);
         // Layer legacy-era filter env vars into the unified filter shape.
         const splitCsvEnv = (val) => (val || '')
           .toString().split(',').map((s) => s.trim()).filter(Boolean);
-        const minSizeGb = Number.parseFloat(process.env.NZB_MIN_RESULT_SIZE_GB);
+        const minSizeGb = Number.parseFloat(sortSource.NZB_MIN_RESULT_SIZE_GB);
         const minSizeBytes = Number.isFinite(minSizeGb) && minSizeGb > 0
           ? minSizeGb * 1024 * 1024 * 1024
           : null;
-        const maxBitrateMbps = Number.parseFloat(process.env.NZB_MAX_BITRATE_MBPS);
+        const maxBitrateMbps = Number.parseFloat(sortSource.NZB_MAX_BITRATE_MBPS);
         const maxBitrateBps = Number.isFinite(maxBitrateMbps) && maxBitrateMbps > 0
           ? maxBitrateMbps * 1_000_000
           : null;
@@ -2823,34 +3095,34 @@ async function streamHandler(req, res) {
           .toString().split('\n').map((s) => s.trim()).filter(Boolean);
         const filters = {
           excluded: {
-            qualities: splitCsvEnv(process.env.NZB_EXCLUDED_QUALITIES),
-            encodes: splitCsvEnv(process.env.NZB_EXCLUDED_ENCODES),
-            visualTags: splitCsvEnv(process.env.NZB_EXCLUDED_VISUAL_TAGS),
-            audioTags: splitCsvEnv(process.env.NZB_EXCLUDED_AUDIO_TAGS),
-            audioChannels: splitCsvEnv(process.env.NZB_EXCLUDED_AUDIO_CHANNELS),
-            languages: splitCsvEnv(process.env.NZB_EXCLUDED_LANGUAGES),
-            releaseGroups: splitCsvEnv(process.env.NZB_EXCLUDED_RELEASE_GROUPS),
+            qualities: splitCsvEnv(sortSource.NZB_EXCLUDED_QUALITIES),
+            encodes: splitCsvEnv(sortSource.NZB_EXCLUDED_ENCODES),
+            visualTags: splitCsvEnv(sortSource.NZB_EXCLUDED_VISUAL_TAGS),
+            audioTags: splitCsvEnv(sortSource.NZB_EXCLUDED_AUDIO_TAGS),
+            audioChannels: splitCsvEnv(sortSource.NZB_EXCLUDED_AUDIO_CHANNELS),
+            languages: splitCsvEnv(sortSource.NZB_EXCLUDED_LANGUAGES),
+            releaseGroups: splitCsvEnv(sortSource.NZB_EXCLUDED_RELEASE_GROUPS),
             // No excluded.resolutions: resolution restriction is handled by the
             // Allowed-Resolutions grid (included.resolutions). A separate
             // excluded-resolutions field had no UI and was removed.
           },
-          included: { resolutions: ALLOWED_RESOLUTIONS || [] },
+          included: { resolutions: effAllowedResolutions || [] },
           ranges: {
             size: Object.keys(sizeRange).length ? sizeRange : undefined,
             bitrate: Object.keys(bitrateRange).length ? bitrateRange : undefined,
           },
           excludedRegex: [
-            ...(Array.isArray(RELEASE_EXCLUSIONS) ? RELEASE_EXCLUSIONS : []),
-            ...linesFromEnv(process.env.NZB_EXCLUDED_REGEX_PATTERNS),
+            ...(Array.isArray(effReleaseExclusions) ? effReleaseExclusions : []),
+            ...linesFromEnv(sortSource.NZB_EXCLUDED_REGEX_PATTERNS),
           ],
-          requiredRegex: linesFromEnv(process.env.NZB_REQUIRED_REGEX_PATTERNS),
+          requiredRegex: linesFromEnv(sortSource.NZB_REQUIRED_REGEX_PATTERNS),
         };
         unified = {
           sortCriteria: legacy.sortCriteria,
           preferred: legacy.preferred,
           filters,
           expressions: {
-            keywords: INDEXER_PREFERRED_KEYWORDS || [],
+            keywords: effPreferredKeywords || [],
           },
           source: 'legacy-migrated',
         };
@@ -2883,11 +3155,11 @@ async function streamHandler(req, res) {
         preferredReleaseGroups: INDEXER_PREFERRED_RELEASE_GROUPS,
         preferredVisualTags: INDEXER_PREFERRED_VISUAL_TAGS,
         preferredAudioTags: INDEXER_PREFERRED_AUDIO_TAGS,
-        preferredKeywords: INDEXER_PREFERRED_KEYWORDS,
+        preferredKeywords: effPreferredKeywords,
         maxSizeBytes: effectiveMaxSizeBytes,
-        releaseExclusions: RELEASE_EXCLUSIONS,
-        allowedResolutions: ALLOWED_RESOLUTIONS,
-        resolutionLimitPerQuality: RESOLUTION_LIMIT_PER_QUALITY,
+        releaseExclusions: effReleaseExclusions,
+        allowedResolutions: effAllowedResolutions,
+        resolutionLimitPerQuality: effResolutionLimit,
       });
     }
     if (Number.isFinite(INDEXER_MIN_RESULT_SIZE_BYTES) && INDEXER_MIN_RESULT_SIZE_BYTES > 0) {
@@ -2896,9 +3168,9 @@ async function streamHandler(req, res) {
     // Per-quality result cap (NZB_RESOLUTION_LIMIT_PER_QUALITY) — the old
     // engine ran this inside prepareSortedResults; the new sort pipeline
     // doesn't, so we apply it here so existing users get the same cap.
-    if (Number.isFinite(RESOLUTION_LIMIT_PER_QUALITY) && RESOLUTION_LIMIT_PER_QUALITY > 0) {
+    if (Number.isFinite(effResolutionLimit) && effResolutionLimit > 0) {
       const { applyResolutionLimits } = require('./src/utils/helpers');
-      finalNzbResults = applyResolutionLimits(finalNzbResults, RESOLUTION_LIMIT_PER_QUALITY);
+      finalNzbResults = applyResolutionLimits(finalNzbResults, effResolutionLimit);
     }
 
     if (triagePrewarmPromise) {
@@ -2969,10 +3241,10 @@ async function streamHandler(req, res) {
 
     // Fetch NZBDav history early — needed to skip completed NZBs from triage pool
     // and filter out failed NZBs from results before building streams
-    const categoryForType = STREAMING_MODE !== 'native' ? nzbdavService.getNzbdavCategory(type) : null;
+    const categoryForType = effStreamingMode !== 'native' ? nzbdavService.getNzbdavCategory(type) : null;
     let historyByTitle = new Map();
     let failedByTitle = new Map();
-    if (STREAMING_MODE !== 'native') {
+    if (effStreamingMode !== 'native') {
       try {
         const [completedResult, failedResult] = await Promise.all([
           nzbdavService.fetchCompletedNzbdavHistory([categoryForType]),
@@ -3091,8 +3363,8 @@ async function streamHandler(req, res) {
     };
     const triageCandidatesToRun = triageEligibleResults.filter((candidate) => !candidateHasConclusiveDecision(candidate));
     const shouldSkipTriageForRequest = requestLacksIdentifiers || isSpecialRequest;
-    const triageWanted = triageCandidatesToRun.length > 0 && !requestedDisable && !shouldSkipTriageForRequest && (requestedEnable || TRIAGE_ENABLED);
-    const effectiveTriageMode = triageWanted ? TRIAGE_MODE : 'disabled';
+    const triageWanted = triageCandidatesToRun.length > 0 && !requestedDisable && !shouldSkipTriageForRequest && (requestedEnable || effTriageEnabled);
+    const effectiveTriageMode = triageWanted ? effTriageMode : 'disabled';
     const shouldAttemptTriage = triageWanted && effectiveTriageMode === 'blocking';
     const shouldAttemptBackgroundTriage = triageWanted && effectiveTriageMode === 'background';
     let triageOutcome = null;
@@ -3164,7 +3436,7 @@ async function streamHandler(req, res) {
           console.warn(`[NZB TRIAGE] Health check failed: ${triageError.message}`);
         }
       }
-    } else if (shouldSkipTriageForRequest && TRIAGE_ENABLED && !requestedDisable) {
+    } else if (shouldSkipTriageForRequest && effTriageEnabled && !requestedDisable) {
       const reason = isSpecialRequest
         ? 'special catalog request'
         : 'non-ID request (no IMDb/TVDB identifier)';
@@ -3189,7 +3461,7 @@ async function streamHandler(req, res) {
             size: candidate.size,
             fileName: candidate.title,
           });
-          if (!prefetchCandidate && STREAMING_MODE !== 'native') {
+          if (!prefetchCandidate && effStreamingMode !== 'native') {
             prefetchCandidate = {
               downloadUrl: candidate.downloadUrl,
               title: candidate.title,
@@ -3214,7 +3486,7 @@ async function streamHandler(req, res) {
             size: candidate.size,
             fileName: candidate.title,
           });
-          if (!prefetchCandidate && TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native') {
+          if (!prefetchCandidate && effPrefetchFirstVerified && effStreamingMode !== 'native') {
             prefetchCandidate = {
               downloadUrl: candidate.downloadUrl,
               title: candidate.title,
@@ -3233,7 +3505,7 @@ async function streamHandler(req, res) {
     }
 
     // If prefetch is enabled, capture first verified NZB payload even when triage cache completion criteria aren't met
-    if (TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native' && !prefetchCandidate && triageDecisions && triageDecisions.size > 0) {
+    if (effPrefetchFirstVerified && effStreamingMode !== 'native' && !prefetchCandidate && triageDecisions && triageDecisions.size > 0) {
       for (const candidate of triageEligibleResults) {
         const decision = triageDecisions.get(candidate.downloadUrl);
         if (decision && decision.status === 'verified') {
@@ -3341,7 +3613,7 @@ async function streamHandler(req, res) {
       });
 
       baseParams.set('downloadUrl', result.downloadUrl);
-      if (AUTO_ADVANCE_ENABLED && contentKey) baseParams.set('contentKey', contentKey);
+      if (effAutoAdvanceEnabled && contentKey) baseParams.set('contentKey', contentKey);
       if (result.guid) baseParams.set('guid', result.guid);
       if (result.size) baseParams.set('size', String(result.size));
       if (result.title) baseParams.set('title', result.title);
@@ -3466,6 +3738,10 @@ async function streamHandler(req, res) {
       }
 
       const tokenSegment = ADDON_STREAM_TOKEN ? `/${ADDON_STREAM_TOKEN}` : '';
+      // Carry the active profile as a URL segment so the callback (stripped by the
+      // profile middleware) resolves the same profile's effective config. Empty for
+      // the default profile -> byte-identical URLs for existing installs.
+      const profileSegment = req.profileName ? `/${req.profileName}` : '';
       const rawFilename = (result.title || 'stream').toString().trim();
       const normalizedFilename = rawFilename
         .replace(/[\\/:*?"<>|]+/g, ' ')
@@ -3475,17 +3751,17 @@ async function streamHandler(req, res) {
       const hasVideoExt = /\.(mkv|mp4|m4v|avi|mov|wmv|mpg|mpeg|ts|webm)$/i.test(fileBase);
       const fileWithExt = hasVideoExt ? fileBase : `${fileBase}.mkv`;
       const encodedFilename = encodeURIComponent(fileWithExt);
-      const streamUrl = `${addonBaseUrl}${tokenSegment}/nzb/stream/${encodeStreamParams(baseParams)}/${encodedFilename}`;
+      const streamUrl = `${addonBaseUrl}${tokenSegment}${profileSegment}/nzb/stream/${encodeStreamParams(baseParams)}/${encodedFilename}`;
       const tags = [];
       if (triageTag) tags.push(triageTag);
-      if (isInstant && STREAMING_MODE !== 'native') tags.push('⚡ Instant');
+      if (isInstant && effStreamingMode !== 'native') tags.push('⚡ Instant');
       if (preferredLanguageLabels.length > 0) {
         preferredLanguageLabels.forEach((language) => tags.push(language));
       }
       // quality summary now part of name; keep tags focused on status/language/size
       if (languageLabel) tags.push(`🌐 ${languageLabel}`);
       if (sizeString) tags.push(sizeString);
-      const addonLabel = ADDON_NAME || DEFAULT_ADDON_NAME;
+      const addonLabel = (profileEff ? profileEff.config.ADDON_NAME : ADDON_NAME) || DEFAULT_ADDON_NAME;
 
       const tagsString = tags.filter(Boolean).join(' • ');
 
@@ -3655,17 +3931,17 @@ async function streamHandler(req, res) {
       // Default stream description template
       const defaultDescriptionPattern = '{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.source::exists["🎥 {stream.source} "||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||"\n"]}{stream.visualTags::join(\' | \')::exists["📺 {stream.visualTags::join(\' | \')}\n"||""]}{stream.audioTags::join(\' \')::exists["🎧 {stream.audioTags::join(\' \')}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(\' \')::exists["🌎 {stream.languages::join(\' \')}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}"||""]}';
       const effectiveDefaultDescriptionPattern = `{stream.title::exists["🎬 {stream.title}\n"||""]}{stream.streamQuality::exists["✨ {stream.streamQuality}\n"||""]}{stream.source::exists["🎥 {stream.source}\n"||""]}{stream.encode::exists["🎞️ {stream.encode}\n"||""]}{stream.visualTags::join(" | ")::exists["📺 {stream.visualTags::join(\" | \")}\n"||""]}{stream.audioTags::join(" ")::exists["🎧 {stream.audioTags::join(\" \")}\n"||""]}{stream.releaseGroup::exists["👥 {stream.releaseGroup}\n"||""]}{stream.size::>0["📦 {stream.size::bytes}\n"||""]}{stream.languages::join(" ")::exists["🌎 {stream.languages::join(\" \")}\n"||""]}{stream.indexer::exists["🔎 {stream.indexer}\n"||""]}{stream.health::exists["🧪 {stream.health}"||""]}`;
-      const effectiveDescriptionPattern = buildPatternFromTokenList(NZB_NAMING_PATTERN, 'long', effectiveDefaultDescriptionPattern);
+      const effectiveDescriptionPattern = buildPatternFromTokenList(profileEff ? profileEff.config.NZB_NAMING_PATTERN : NZB_NAMING_PATTERN, 'long', effectiveDefaultDescriptionPattern);
       const formattedTitle = formatStreamTitle(effectiveDescriptionPattern, namingContext, effectiveDefaultDescriptionPattern);
 
       const defaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
       const effectiveDefaultNamePattern = '{addon.name} {stream.health::exists["{stream.health} "||""]}{stream.instant::istrue["⚡ "||""]}{stream.resolution::exists["{stream.resolution}"||""]}';
-      const effectiveNamePattern = buildPatternFromTokenList(NZB_DISPLAY_NAME_PATTERN, 'short', effectiveDefaultNamePattern);
+      const effectiveNamePattern = buildPatternFromTokenList(profileEff ? profileEff.config.NZB_DISPLAY_NAME_PATTERN : NZB_DISPLAY_NAME_PATTERN, 'short', effectiveDefaultNamePattern);
       const formattedName = formatStreamTitle(effectiveNamePattern, namingContext, effectiveDefaultNamePattern);
 
       // Build behavior hints based on streaming mode
       let behaviorHints;
-      if (STREAMING_MODE === 'native') {
+      if (effStreamingMode === 'native') {
         // Native mode: minimal behaviorHints for Stremio v5 native NZB streaming
         behaviorHints = {
           bingeGroup: `usenetstreamer-${detectedResolutionToken || 'unknown'}`,
@@ -3725,13 +4001,20 @@ async function streamHandler(req, res) {
 
       // Build the stream object based on streaming mode
       let stream;
-      if (STREAMING_MODE === 'native') {
+      if (effStreamingMode === 'native') {
         // Native mode: Stremio v5 native NZB streaming
         const nntpServers = buildNntpServersArray();
+        // On HTTPS, serve the NZB through the addon (encrypted — hides the indexer
+        // API key from the client and works with any indexer, not just newznab). On
+        // plain HTTP, fall back to the indexer's direct HTTPS link (Stremio refuses
+        // to play HTTP addon URLs).
+        const nativeNzbUrl = /^https:/i.test(addonBaseUrl)
+          ? `${addonBaseUrl}${ADDON_STREAM_TOKEN ? `/${ADDON_STREAM_TOKEN}` : ''}/nzb/fetch/${encodeStreamParams(new URLSearchParams({ downloadUrl: result.downloadUrl, filename: result.title || '' }))}`
+          : result.downloadUrl;
         stream = {
           name: formattedName,
           description: formattedTitle,
-          nzbUrl: result.downloadUrl,
+          nzbUrl: nativeNzbUrl,
           servers: nntpServers.length > 0 ? nntpServers : undefined,
           url: undefined,
           infoHash: undefined,
@@ -3817,11 +4100,15 @@ async function streamHandler(req, res) {
     //      (the bg session or NZBDav history may still have ready NZBs to serve instantly)
     const hasVerifiedOrInstantStreams = verifiedStreams.length > 0 || instantStreams.length > 0;
     const cachedSmartPlayEligible = !shouldAttemptBackgroundTriage
-      && TRIAGE_MODE === 'background'
-      && TRIAGE_ENABLED
+      && effTriageMode === 'background'
+      && effTriageEnabled
       && hasVerifiedOrInstantStreams;
-    if ((shouldAttemptBackgroundTriage || cachedSmartPlayEligible) && STREAMING_MODE !== 'native' && streams.length > 0 && TRIAGE_NNTP_CONFIG) {
+    if ((shouldAttemptBackgroundTriage || cachedSmartPlayEligible) && effStreamingMode !== 'native' && streams.length > 0 && TRIAGE_NNTP_CONFIG) {
       const tokenSegment = ADDON_STREAM_TOKEN ? `/${ADDON_STREAM_TOKEN}` : '';
+      // Carry the active profile as a URL segment so the callback (stripped by the
+      // profile middleware) resolves the same profile's effective config. Empty for
+      // the default profile -> byte-identical URLs for existing installs.
+      const profileSegment = req.profileName ? `/${req.profileName}` : '';
       const smartPlayParams = new URLSearchParams({ contentKey, type, id });
       if (requestedEpisode) {
         smartPlayParams.set('season', String(requestedEpisode.season));
@@ -3859,7 +4146,7 @@ async function streamHandler(req, res) {
         smartPlayFilename = releaseYear ? `${safeTitle}_${releaseYear}.mkv` : `${safeTitle}.mkv`;
       }
 
-      const smartPlayUrl = `${addonBaseUrl}${tokenSegment}/nzb/smartplay/${encodeStreamParams(smartPlayParams)}/${encodeURIComponent(smartPlayFilename)}`;
+      const smartPlayUrl = `${addonBaseUrl}${tokenSegment}${profileSegment}/nzb/smartplay/${encodeStreamParams(smartPlayParams)}/${encodeURIComponent(smartPlayFilename)}`;
 
       // Build Smart Play description with title and episode info
       let smartPlayTitle = searchTitle;
@@ -3869,7 +4156,7 @@ async function streamHandler(req, res) {
         smartPlayTitle = `${searchTitle} (${releaseYear})`;
       }
 
-      const addonLabel = ADDON_NAME || DEFAULT_ADDON_NAME;
+      const addonLabel = (profileEff ? profileEff.config.ADDON_NAME : ADDON_NAME) || DEFAULT_ADDON_NAME;
       const smartPlayDescription = cachedSmartPlayEligible
         ? `🎬 ${smartPlayTitle}\n✅ Auto-selects the best healthy NZB\n⚡ Health check complete — instant playback`
         : `🎬 ${smartPlayTitle}\n✅ Auto-selects the best healthy NZB\n🔄 Health check running in background...`;
@@ -3892,7 +4179,7 @@ async function streamHandler(req, res) {
     }
 
     // Log cached streams count (only relevant for NZBDav mode)
-    if (STREAMING_MODE !== 'native') {
+    if (effStreamingMode !== 'native') {
       const instantCount = streams.filter((stream) => stream?.meta?.cached).length;
       if (instantCount > 0) {
         console.log(`[STREMIO] ${instantCount}/${streams.length} streams already cached in NZBDav`);
@@ -3900,7 +4187,7 @@ async function streamHandler(req, res) {
     }
 
     const requestElapsedMs = Date.now() - requestStartTs;
-    const modeLabel = STREAMING_MODE === 'native' ? 'native NZB' : 'NZB';
+    const modeLabel = effStreamingMode === 'native' ? 'native NZB' : 'NZB';
     console.log(`[STREMIO] Returning ${streams.length} ${modeLabel} streams`, { elapsedMs: requestElapsedMs, ts: new Date().toISOString() });
     if (process.env.DEBUG_STREAM_PAYLOADS === 'true') {
       streams.forEach((stream, index) => {
@@ -3927,7 +4214,7 @@ async function streamHandler(req, res) {
     res.json(responsePayload);
 
     // Background triage: start health checking after the response is sent
-    if (shouldAttemptBackgroundTriage && STREAMING_MODE !== 'native' && TRIAGE_NNTP_CONFIG && triageCandidatesToRun.length > 0) {
+    if (shouldAttemptBackgroundTriage && effStreamingMode !== 'native' && TRIAGE_NNTP_CONFIG && triageCandidatesToRun.length > 0) {
       // Reuse existing background session if it's still running or has results
       const existingBgSession = backgroundTriage.getSession(contentKey);
       if (existingBgSession) {
@@ -3987,9 +4274,9 @@ async function streamHandler(req, res) {
             getCachedEntry: (url) => diskNzbCache.getFromDisk(url),
             category: categoryForType,
             requestedEpisode,
-            prefetchEnabled: TRIAGE_PREFETCH_FIRST_VERIFIED,
+            prefetchEnabled: effPrefetchFirstVerified,
             smartPlayMode: SMART_PLAY_MODE,
-            backupCount: AUTO_ADVANCE_BACKUP_COUNT,
+            backupCount: effAutoAdvanceBackupCount,
             initialBatchSize: TRIAGE_MAX_CANDIDATES,
             maxEvaluate: Math.max(12, TRIAGE_MAX_CANDIDATES * 2),
             historyByTitle,
@@ -4059,8 +4346,8 @@ async function streamHandler(req, res) {
     // Auto-advance session: create an auto-advance queue from ranked results whenever auto-advance is enabled
     // but NOT in background triage mode (which creates its own auto-advance queue via backgroundTriage.start)
     // Covers: "auto-advance" mode (no triage) and "health-check-auto-advance" mode (blocking triage + auto-advance)
-    if (AUTO_ADVANCE_ENABLED && !shouldAttemptBackgroundTriage
-      && STREAMING_MODE !== 'native' && finalNzbResults.length > 1) {
+    if (effAutoAdvanceEnabled && !shouldAttemptBackgroundTriage
+      && effStreamingMode !== 'native' && finalNzbResults.length > 1) {
       const existingAutoAdvance = autoAdvanceQueue.getSession(contentKey);
       if (!existingAutoAdvance) {
         // When triage ran, put verified NZBs first so auto-advance prefers them
@@ -4118,17 +4405,17 @@ async function streamHandler(req, res) {
         autoAdvanceQueue.createSession(contentKey, autoAdvanceCandidates, {
           queueToNzbdav: queueToNzbdavAutoAdvance,
           getCachedEntry: (url) => diskNzbCache.getFromDisk(url),
-          backupCount: AUTO_ADVANCE_BACKUP_COUNT,
+          backupCount: effAutoAdvanceBackupCount,
           requestedEpisode,
         });
-        console.log(`[AUTO-ADVANCE] Created auto-advance session for ${contentKey} (${autoAdvanceCandidates.length} candidates, backup=${AUTO_ADVANCE_BACKUP_COUNT})`);
+        console.log(`[AUTO-ADVANCE] Created auto-advance session for ${contentKey} (${autoAdvanceCandidates.length} candidates, backup=${effAutoAdvanceBackupCount})`);
       }
     }
 
-    if (TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native' && !prefetchCandidate && finalNzbResults.length > 0) {
+    if (effPrefetchFirstVerified && effStreamingMode !== 'native' && !prefetchCandidate && finalNzbResults.length > 0) {
       // Only prefetch unverified top result if no triage ran (pure auto-advance mode).
       // When triage ran (health-check modes), we only prefetch verified NZBs.
-      if (!TRIAGE_ENABLED) {
+      if (!effTriageEnabled) {
         prefetchCandidate = {
           downloadUrl: finalNzbResults[0].downloadUrl,
           title: finalNzbResults[0].title,
@@ -4139,7 +4426,7 @@ async function streamHandler(req, res) {
       }
     }
 
-    if (TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native' && prefetchCandidate) {
+    if (effPrefetchFirstVerified && effStreamingMode !== 'native' && prefetchCandidate) {
       prunePrefetchedNzbdavJobs();
       // Skip if already completed in NZBDav (survives addon restarts unlike the in-memory map)
       const prefetchNormTitle = normalizeReleaseTitle(prefetchCandidate.title);
@@ -4147,7 +4434,7 @@ async function streamHandler(req, res) {
       if (alreadyInNzbdav) {
         console.log(`[PREFETCH] Skipping — already completed in NZBDav: ${prefetchCandidate.title}`);
         // Tell the auto-advance session this URL is already handled
-        if (AUTO_ADVANCE_ENABLED && contentKey) {
+        if (effAutoAdvanceEnabled && contentKey) {
           const fbSession = autoAdvanceQueue.getSession(contentKey);
           if (fbSession) fbSession.markExternallyReady(prefetchCandidate.downloadUrl);
         }
@@ -4185,7 +4472,7 @@ async function streamHandler(req, res) {
         // Mark the prefetch URL as in-flight in the auto-advance session so the
         // pipeline won't try to queue the same NZB if the user clicks before
         // the prefetch completes (prevents duplicate NZBDav entries).
-        if (AUTO_ADVANCE_ENABLED && contentKey) {
+        if (effAutoAdvanceEnabled && contentKey) {
           const fbSession = autoAdvanceQueue.getSession(contentKey);
           if (fbSession) fbSession.markExternallyProcessing(prefetchCandidate.downloadUrl);
         }
@@ -4210,11 +4497,11 @@ async function streamHandler(req, res) {
                 // Always notify the auto-advance session that the prefetched NZB is ready,
                 // so it can be served immediately if the user clicks a different (failed) NZB.
                 // With faster failover (backupCount > 0), also activate the session to pre-fill backup slots.
-                if (AUTO_ADVANCE_ENABLED && prefetchContentKey) {
+                if (effAutoAdvanceEnabled && prefetchContentKey) {
                   const fbSession = autoAdvanceQueue.getSession(prefetchContentKey);
                   if (fbSession) {
                     fbSession.markExternallyReady(prefetchDownloadUrl);
-                    if (AUTO_ADVANCE_BACKUP_COUNT > 0) {
+                    if (effAutoAdvanceBackupCount > 0) {
                       console.log(`[PREFETCH] Activating auto-advance session for backup (faster failover)`);
                       fbSession.activate();
                     } else {
@@ -4233,7 +4520,7 @@ async function streamHandler(req, res) {
 
                 // Mark failed but don't activate session — nobody clicked yet.
                 // The pipeline will skip this URL when the user eventually clicks.
-                if (AUTO_ADVANCE_ENABLED && prefetchContentKey) {
+                if (effAutoAdvanceEnabled && prefetchContentKey) {
                   const fbSession = autoAdvanceQueue.getSession(prefetchContentKey);
                   if (fbSession) {
                     console.log(`[PREFETCH] Marking failed in auto-advance session for ${prefetchContentKey} (no cascade)`);
@@ -4251,7 +4538,7 @@ async function streamHandler(req, res) {
             console.warn(`[PREFETCH] Failed to queue NZB: ${prefetchError.message}`);
 
             // Mark failed but don't activate — no user click yet
-            if (AUTO_ADVANCE_ENABLED && prefetchContentKey) {
+            if (effAutoAdvanceEnabled && prefetchContentKey) {
               const fbSession = autoAdvanceQueue.getSession(prefetchContentKey);
               if (fbSession) {
                 console.log(`[PREFETCH] Marking failed in auto-advance session for ${prefetchContentKey} (no cascade)`);
@@ -4288,6 +4575,10 @@ async function handleSmartPlay(req, res) {
       Object.assign(req.query, decoded);
     }
   }
+  // Per-profile protection — the profile travels in the callback URL (stripped by the
+  // middleware). Unknown/absent profile -> global protection (don't break playback).
+  const profileEff = req.profileName ? profileManager.getEffectiveConfig(req.profileName) : null;
+  const effProtection = resolveRequestProtection(profileEff);
   const { contentKey, type = 'movie', id = '' } = req.query;
   if (!contentKey) {
     res.status(400).json({ error: 'Missing contentKey parameter' });
@@ -4419,7 +4710,7 @@ async function handleSmartPlay(req, res) {
       const shouldWaitForTopRankedSelection = !playable.bestVerified
         && !bgSession.selectionReady
         && !bgSession.triageComplete
-        && (topRankedDeferredForVerification || !TRIAGE_PREFETCH_FIRST_VERIFIED);
+        && (topRankedDeferredForVerification || !effProtection.prefetchFirstVerified);
 
       if (shouldWaitForTopRankedSelection) {
         console.log(`[SMART-PLAY] Top-ranked mode — waiting for first-pass selection for ${contentKey}...`);
@@ -4451,7 +4742,7 @@ async function handleSmartPlay(req, res) {
     }
 
     // Fastest verified fallback activation (on-demand only when prefetch is OFF).
-    if (!TRIAGE_PREFETCH_FIRST_VERIFIED && !peekedSlot && SMART_PLAY_MODE !== 'top-ranked') {
+    if (!effProtection.prefetchFirstVerified && !peekedSlot && SMART_PLAY_MODE !== 'top-ranked') {
       if (bgSession.autoAdvanceSession && !bgSession.autoAdvanceSession.activated) {
         console.log(`[SMART-PLAY] Fastest mode — activating auto-advance (first verified wins)`);
         bgSession.autoAdvanceSession.activate();
@@ -4546,6 +4837,10 @@ async function handleNzbdavStream(req, res) {
       Object.assign(req.query, decoded);
     }
   }
+  // Per-profile protection — profile travels in the callback URL (stripped by the
+  // middleware). Unknown/absent profile -> global protection (don't break playback).
+  const profileEff = req.profileName ? profileManager.getEffectiveConfig(req.profileName) : null;
+  const effProtection = resolveRequestProtection(profileEff);
   let { downloadUrl, type = 'movie', id = '', title = 'NZB Stream' } = req.query;
   const easynewsPayload = typeof req.query.easynewsPayload === 'string' ? req.query.easynewsPayload : null;
   const declaredSize = Number(req.query.size);
@@ -4597,7 +4892,7 @@ async function handleNzbdavStream(req, res) {
 
     // Check if health check already blocked this NZB — skip straight to auto-advance
     const contentKey = req.query.contentKey || null;
-    if (AUTO_ADVANCE_ENABLED && contentKey) {
+    if (effProtection.autoAdvanceEnabled && contentKey) {
       const bgSession = backgroundTriage.getSession(contentKey);
       const fbSession = autoAdvanceQueue.getSession(contentKey);
       const triageStatus = bgSession?.getTriageStatus(downloadUrl)
@@ -4708,8 +5003,8 @@ async function handleNzbdavStream(req, res) {
 
       // Auto-advance: check if there's a background triage session or auto-advance session with backup NZBs
       const contentKey = req.query.contentKey || null;
-      const bgSession = AUTO_ADVANCE_ENABLED && contentKey ? backgroundTriage.getSession(contentKey) : null;
-      const fbSession = AUTO_ADVANCE_ENABLED && contentKey && !bgSession ? autoAdvanceQueue.getSession(contentKey) : null;
+      const bgSession = effProtection.autoAdvanceEnabled && contentKey ? backgroundTriage.getSession(contentKey) : null;
+      const fbSession = effProtection.autoAdvanceEnabled && contentKey && !bgSession ? autoAdvanceQueue.getSession(contentKey) : null;
       const activeSession = bgSession || fbSession;
       if (activeSession && !res.headersSent) {
         console.log(`[AUTO-ADVANCE] Attempting auto-advance for ${contentKey}...`);
@@ -4824,6 +5119,49 @@ async function handleNzbdavStream(req, res) {
 
 ['/:token/easynews/nzb', '/easynews/nzb'].forEach((route) => {
   app.get(route, handleEasynewsNzbDownload);
+});
+
+// Native HTTPS NZB proxy: fetch the NZB server-side and serve it, so Stremio
+// downloads it FROM the addon (the encrypted params hide the indexer API key from
+// the client) instead of from a direct indexer link. Used by native mode only when
+// the addon is on HTTPS. The encoded params are AES-GCM encrypted, so a client can
+// only replay addon-generated URLs — no SSRF to arbitrary URLs.
+async function handleNzbFetch(req, res) {
+  const decoded = req.params.encodedParams ? decodeStreamParams(req.params.encodedParams) : null;
+  if (!decoded || !decoded.downloadUrl) {
+    res.status(400).json({ error: 'Invalid or missing NZB parameters' });
+    return;
+  }
+  try {
+    let buffer = null;
+    const cachedEntry = diskNzbCache.getFromDisk(decoded.downloadUrl);
+    if (cachedEntry?.payloadBuffer) {
+      buffer = cachedEntry.payloadBuffer; // reuse verified payload — no re-download
+    } else {
+      const response = await axios.get(decoded.downloadUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+        maxRedirects: 5,
+        validateStatus: (status) => status >= 200 && status < 400,
+      });
+      buffer = Buffer.from(response.data);
+    }
+    const rawName = (decoded.filename || 'stream').toString();
+    const safeName = rawName.replace(/[^\w.\-]+/g, '_').slice(0, 120) || 'stream';
+    const fileName = /\.nzb$/i.test(safeName) ? safeName : `${safeName}.nzb`;
+    res.setHeader('Content-Type', 'application/x-nzb+xml');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    if (req.method === 'HEAD') { res.status(200).end(); return; }
+    res.status(200).send(buffer);
+  } catch (error) {
+    console.warn('[NZB FETCH] Failed to fetch NZB', error?.message || error);
+    res.status(502).json({ error: sanitizeErrorForClient(error) || 'Unable to fetch NZB' });
+  }
+}
+
+['/:token/nzb/fetch/:encodedParams', '/nzb/fetch/:encodedParams'].forEach((route) => {
+  app.get(route, handleNzbFetch);
+  app.head(route, handleNzbFetch);
 });
 
 function startHttpServer() {

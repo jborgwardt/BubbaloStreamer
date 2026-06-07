@@ -11,6 +11,33 @@
   <link rel="apple-touch-icon" href="/assets/icon.png" />
   <link rel="icon" href="/assets/icon.png" type="image/png" />
   <link rel="stylesheet" href="styles.css" />
+  <style>
+    /* Profile switcher — a sibling sub-panel matching the form's .group panels,
+       with tabs styled as pill buttons using the shared button language. */
+    .profile-switcher { background: var(--bg-panel); border: 1px solid rgba(86,110,135,0.25); border-radius: var(--radius-md); padding: 1.4rem 1.6rem; margin: 0; display: flex; flex-direction: column; gap: 0.9rem; box-shadow: 0 18px 40px rgba(2,12,24,0.4); }
+    .profile-tabs { display: flex; flex-wrap: wrap; gap: 0.55rem; align-items: center; }
+    .profile-tab { padding: 0.55rem 1.2rem; border-radius: 999px; border: 1px solid var(--border-strong); background: rgba(62,84,110,0.22); color: var(--text-secondary); cursor: pointer; font-size: 0.92rem; font-weight: 600; line-height: 1.2; transition: transform 120ms ease, background 160ms ease, color 160ms ease, border-color 160ms ease, box-shadow 180ms ease; }
+    .profile-tab:hover { background: rgba(62,84,110,0.42); border-color: rgba(95,180,255,0.6); color: var(--text-primary); transform: translateY(-1px); }
+    .profile-tab.active { background: var(--accent-gradient); color: #051521; border-color: transparent; text-shadow: 0 1px 0 rgba(255,255,255,0.35); box-shadow: var(--shadow-lift); }
+    .profile-tab.active:hover { transform: translateY(-1px); }
+    .profile-tab-add { background: transparent; border: 1.5px dashed rgba(95,120,150,0.7); color: var(--text-secondary); }
+    .profile-tab-add:hover { background: transparent; border-color: rgba(95,180,255,0.6); color: #9fdcff; }
+    .profile-edit-row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; margin: 0; }
+    .profile-edit-row #profileNameInput { flex: 1 1 220px; min-width: 160px; }
+    .profile-inherit { opacity: 0.45; }
+    .profile-override-label { font-size: 0.82rem; font-weight: 500; margin-left: auto; display: inline-flex; gap: 0.4rem; align-items: center; cursor: pointer; color: var(--text-secondary); }
+    /* Guidance (not an error) — amber so it stands out from plain hints. */
+    #profileMultiInstallWarning, #profileMultiInstallWarning strong { color: var(--warning); }
+    .group > h3 { display: flex; align-items: center; gap: 0.5rem; }
+    /* In profile mode, shared (non-per-profile) sections are force-hidden regardless of
+       what the rich builders do to their .hidden class. */
+    #configForm.profile-mode .group:not([data-profile-section]) { display: none !important; }
+    /* Shared fields that live inside a per-profile section (e.g. Base URL / Stream Token
+       in "Addon Name") stay global — hide them while editing a profile. */
+    #configForm.profile-mode .profile-foreign-field { display: none !important; }
+    /* Keep the Save bar reachable instead of buried at the bottom of a long form. */
+    .actions { position: sticky; bottom: 0; background: rgba(11,17,24,0.96); backdrop-filter: blur(4px); padding: 0.85rem 0.25rem; margin-top: 1rem; z-index: 5; border-top: 1px solid rgba(80,140,220,0.18); }
+  </style>
 </head>
 <body>
   <main class="container">
@@ -38,22 +65,41 @@
         <strong>Upgrading from a version before v1.7.6?</strong> The stream token is now separate from the admin token. Your manifest URL has changed — you may need to reinstall the addon in Stremio using the new URL shown after saving.
         <button type="button" class="dismiss-btn" onclick="this.parentElement.remove()">Dismiss</button>
       </div>
+      <div class="profile-switcher" id="profileSwitcherBar">
+        <div class="profile-tabs" id="profileTabs"></div>
+        <div class="profile-edit-row hidden" id="profileEditRow">
+          <input id="profileNameInput" type="text" placeholder="Profile name" maxlength="64" />
+          <button type="button" id="deleteProfileBtn" class="secondary">Delete</button>
+        </div>
+        <p class="hint" id="profileHint">Profiles share all credentials, indexers, NZBDav and NNTP settings. They only override sorting/filtering, naming, stream protection, streaming mode, catalog, and addon name. Each profile installs as its own Stremio addon at <code>/&lt;token&gt;/&lt;profile&gt;/manifest.json</code>.</p>
+        <p class="hint hidden" id="profileMultiInstallWarning">⚠️ <strong>Install only one profile per Stremio account.</strong> Stremio queries every installed addon on each title, so adding two profiles to the same account runs this addon twice per request — duplicating searches and triage, and slowing results. Use different profiles on different Stremio accounts or devices.</p>
+        <p class="hint hidden" id="profileInstallHint"></p>
+      </div>
       <form id="configForm" novalidate>
-        <section class="group streaming-mode-section">
+        <section class="group streaming-mode-section" data-profile-section="Streaming Mode">
           <h3>Streaming Mode</h3>
           <div class="field-grid">
-            <label>
-              <select name="STREAMING_MODE" id="streamingModeSelect" disabled>
+            <label class="wide-field streaming-mode-field">
+              <select name="STREAMING_MODE" id="streamingModeSelect">
                 <option value="nzbdav">NZBDav Mode (All Platforms)</option>
-                <option value="native">Desktop Native Mode (Stremio v5 Desktop)</option>
+                <option value="native">Stremio Native Mode (Stremio v5: desktop, Android TV &amp; mobile)</option>
               </select>
-              <span class="field-hint" id="streamingModeHint">To switch mode, set <code>"STREAMING_MODE": "native"</code> in <code>runtime-env.json</code> and restart.</span>
+              <span class="field-hint" id="streamingModeHint">Applies on save — no restart needed. Switching mode changes the addon ID, so you may need to re-add the addon in Stremio.</span>
             </label>
           </div>
           <div id="nativeModeNotice" class="info-box hidden">
-            <strong>⚡ Desktop Native Mode</strong>
-            <p>Streams NZBs directly using your NNTP provider credentials. No NZBDav required. Only works with Stremio v5 on all desktop versions and Android TV.</p>
-            <p>Prowlarr/NZBHydra are disabled in this mode — use direct Newznab indexers only.</p>
+            <strong>⚡ Stremio Native Mode</strong>
+            <p>Streams NZBs directly using your NNTP provider credentials. No NZBDav required. Requires Stremio v5 (desktop, Android TV, and Android mobile).</p>
+            <p>💡 <b>Recommended:</b> set Stream Protection (below) to “Upfront Health Check”. Native mode plays NZBs directly, so a dead or incomplete NZB just fails in the player — an upfront health check verifies each stream before it's shown.</p>
+            <!-- HTTP-only constraints: shown when ADDON_BASE_URL is not HTTPS. On
+                 HTTP the addon must hand Stremio the indexer's direct link, so the
+                 manager is disabled and raw links (with API keys) reach the client. -->
+            <div id="nativeHttpNotice" class="hidden">
+              <p>Prowlarr/NZBHydra are disabled in this mode — use direct Newznab indexers only.</p>
+              <p>⚠️ Your addon is on <code>http</code>, so native mode sends raw indexer/NZB links (which can contain your API keys) directly to the Stremio client. Only enable if you're comfortable with that. Serve the addon over <code>https</code> to proxy these links through your addon and hide your keys.</p>
+            </div>
+            <!-- HTTPS: links are proxied + encrypted, and any indexer works. -->
+            <p id="nativeHttpsNotice" class="hidden">✅ Your addon is on <code>https</code>, so NZB links are proxied through your addon and encrypted — indexer API keys are never exposed to the client, and Prowlarr/NZBHydra (or any indexer) work in this mode.</p>
           </div>
         </section>
 
@@ -151,7 +197,7 @@
         <section class="group">
           <h3>Built-in Easynews Indexer</h3>
           <p class="hint">Provide your Easynews credentials to let the addon search Easynews directly (no external bridge required). Only the username and password are needed.</p>
-          <p class="warning hidden" id="easynewsHttpsWarning">Desktop Native mode: Easynews results only play if your addon is served over HTTPS (Stremio refuses plain HTTP URLs).</p>
+          <p class="warning hidden" id="easynewsHttpsWarning">Stremio Native mode: Easynews results only play if your addon is served over HTTPS (Stremio refuses plain HTTP URLs).</p>
           <div class="field-grid">
             <label class="checkbox">
               <input name="EASYNEWS_ENABLED" type="checkbox" />
@@ -175,7 +221,7 @@
           </div>
         </section>
 
-        <section class="group">
+        <section class="group" data-profile-section="Sorting &amp; Filters">
           <h3>Result Sorting &amp; Filters</h3>
           <div class="field-grid">
             <div class="sort-order-builder wide-field" data-sort-order-builder="global">
@@ -476,7 +522,7 @@
               </label>
             </div>
             <details class="option-suggestions">
-              <summary>Quick-add common tags</summary>
+              <summary>Supported tags</summary>
               <p class="option-suggestions-hint">Click a chip to add it to the matching field above. You can still type any custom value directly into the fields.</p>
               <div class="option-suggestions-grid"
                    data-suggestions
@@ -521,7 +567,7 @@
               </label>
             </div>
             <details class="option-suggestions">
-              <summary>Quick-add common tags</summary>
+              <summary>Supported tags</summary>
               <p class="option-suggestions-hint">Click a chip to add it to the matching field above. You can still type any custom value directly into the fields.</p>
               <div class="option-suggestions-grid"
                    data-suggestions
@@ -598,7 +644,7 @@
           </details>
         </section>
 
-        <section class="group">
+        <section class="group" data-profile-section="Stream Naming">
           <h3>Stream Naming</h3>
           <p class="hint">Customize how streams appear in Stremio. Leave blank to use the default. Easiest way: enter a comma-separated list of fields.</p>
           <div class="field-grid">
@@ -702,7 +748,7 @@ health'></textarea>
           </div>
         </section>
 
-        <section class="group" id="stremioCatalogGroup">
+        <section class="group" id="stremioCatalogGroup" data-profile-section="Stremio Catalog">
           <h3>Stremio Catalog</h3>
           <p class="hint">Adds a "Completed NZBs" catalog inside Stremio so you can browse and replay items already downloaded to NZBDav. Titles and posters are enriched via TMDb when configured.</p>
           <div class="field-grid">
@@ -713,7 +759,7 @@ health'></textarea>
           </div>
         </section>
 
-        <section class="group" id="streamProtectionGroup">
+        <section class="group" id="streamProtectionGroup" data-profile-section="Stream Protection">
           <h3>Stream Protection</h3>
           <div class="field-grid">
             <label class="wide-field">Protection Mode (how do you want the addon to handle missing articles?)
@@ -1009,7 +1055,7 @@ health'></textarea>
           </div>
         </section>
 
-        <section class="group">
+        <section class="group" data-profile-section="Addon Name">
           <h3>Addon Metadata</h3>
           <div class="field-grid">
             <label>Addon Display Name

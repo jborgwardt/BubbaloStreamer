@@ -127,11 +127,13 @@ async function getOrCreateNzbdavStream(cacheKey, builder) {
   }
 }
 
-function buildNzbdavCacheKey(downloadUrl, category, requestedEpisode = null) {
+function buildNzbdavCacheKey(downloadUrl, category, requestedEpisode = null, profileName = null) {
   const parts = [downloadUrl, category];
   if (requestedEpisode) {
     parts.push(`S${requestedEpisode.season}E${requestedEpisode.episode}`);
   }
+  // Appended only when set, so default (no-profile) keys stay byte-identical.
+  if (profileName) parts.push(`p:${profileName}`);
   return parts.join('::');
 }
 

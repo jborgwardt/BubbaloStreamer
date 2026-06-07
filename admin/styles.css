@@ -244,6 +244,13 @@ header h1 {
   max-width: 520px;
 }
 
+/* Streaming Mode: the lone select spans the row (so it isn't squeezed into one
+   narrow grid column) but stays left-aligned at a sensible width — its "Native"
+   option label is long and needs the horizontal room. */
+.field-grid label.streaming-mode-field > select {
+  max-width: 600px;
+}
+
 .field-hint {
   font-weight: 400;
   font-size: 0.88rem;
