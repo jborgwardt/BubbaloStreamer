@@ -1,3 +1,5 @@
+const { foldAccents } = require('../../utils/stringUtils');
+
 function appendEpisodeSuffix(title, { type, releaseYear, seasonNum, episodeNum }) {
   if (!title) return '';
   if (type === 'movie' && Number.isFinite(releaseYear)) return `${title} ${releaseYear}`;
@@ -48,7 +50,14 @@ function buildEasynewsSearchParams({
   // so we compare the ASCII result against the original character count, not itself.
   const tryAdd = (rawTitle, alreadyHasSuffix = false, originalTitle = null) => {
     if (!rawTitle) return;
-    const normalized = normalizeToAscii(rawTitle.trim());
+    // Fold accents first (Café→Cafe, Über→Ueber) so the query matches the ASCII
+    // form release names use, then ASCII-normalize for anything left.
+    let normalized = normalizeToAscii(foldAccents(rawTitle.trim()));
+    if (!normalized) return;
+    // Slash/backslash in a title (e.g. "Love/Hate") isn't a word boundary to
+    // Easynews search, so the literal query returns 0 hits. Treat them as
+    // spaces so the query matches dotted release names ("Love.Hate...").
+    normalized = normalized.replace(/[/\\]+/g, ' ').replace(/\s+/g, ' ').trim();
     if (!normalized) return;
     // Skip if normalization destroyed too much of the original title (e.g. CJK → sparse ASCII)
     const original = (originalTitle || rawTitle).replace(/\s+/g, '');

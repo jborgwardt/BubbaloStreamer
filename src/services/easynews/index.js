@@ -1,6 +1,7 @@
 const axios = require('axios');
 const { parseTorrentTitle } = require('../../utils/lib/parse-torrent-title/index.js');
 const { stripTrailingSlashes, toBoolean } = require('../../utils/config');
+const { foldAccents } = require('../../utils/stringUtils');
 
 const EASYNEWS_BASE_URL = 'https://members.easynews.com';
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -83,10 +84,14 @@ function buildAuthConfig(override = null) {
 
 function sanitizePhrase(text) {
   if (!text) return '';
-  const working = text
+  const working = foldAccents(text)
     .replace(/&/g, ' and ')
-    .replace(/[\.\-_:\s]+/g, ' ')
-    .replace(/[^\w\sÀ-ÿ]/g, '')
+    // Slash/backslash are word separators (e.g. "Love/Hate" → "love hate"), not
+    // characters to delete — otherwise the phrase collapses to "lovehate" and
+    // never matches dotted release names. Mirrors sanitizeStrictSearchPhrase.
+    .replace(/[\.\-_:/\\\s]+/g, ' ')
+    // Accents already folded to ASCII above; drop the À-ÿ allowance.
+    .replace(/[^\w\s]/g, '')
     .toLowerCase()
     .trim();
   return working;
@@ -134,10 +139,10 @@ const TITLE_SIMILARITY_THRESHOLD = 0.85;
 
 function normaliseTitle(text) {
   if (!text) return '';
-  return text
-    .replace(/&/g, 'and')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
+  // Use the shared accent fold (umlaut digraphs + diacritic strip) so this
+  // matches stringUtils.normaliseTitle \u2014 otherwise German titles ("\u00dcber"\u2192"uber"
+  // here vs "ueber" from a release) fall below the similarity threshold.
+  return foldAccents(String(text).replace(/&/g, 'and'))
     .replace(/[^\p{L}\p{N}]/gu, '')
     .toLowerCase();
 }

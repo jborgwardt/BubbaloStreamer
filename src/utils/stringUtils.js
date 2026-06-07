@@ -1,11 +1,31 @@
 const TITLE_SIMILARITY_THRESHOLD = 0.85;
 
+// German letters expand to their ASCII digraphs the way release names spell them
+// (ä→ae, ü→ue, ß→ss), applied BEFORE NFD so they aren't reduced to bare vowels.
+const UMLAUT_MAP = { 'Ä': 'Ae', 'ä': 'ae', 'Ö': 'Oe', 'ö': 'oe', 'Ü': 'Ue', 'ü': 'ue', 'ß': 'ss' };
+
+// Fold accents to ASCII so a metadata title ("Café", "Über") compares equal to
+// the ASCII form release names use ("Cafe", "Ueber"). Mirrors the query-side
+// ASCII folding (tmdb.normalizeToAscii) so both sides of a match normalize the
+// same way. Umlaut digraphs first, then strip remaining combining diacritics.
+function foldAccents(text) {
+  return String(text || '')
+    .replace(/[ÄäÖöÜüß]/g, (c) => UMLAUT_MAP[c])
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '');
+}
+
 function sanitizeStrictSearchPhrase(text) {
   if (!text) return '';
-  return text
+  return foldAccents(text)
     .replace(/&/g, ' and ')
-    .replace(/[\.\-_:\s]+/g, ' ')
-    .replace(/[^\w\sÀ-ÿ]/g, '')
+    // Treat separators — including slash/backslash — as a single space so a
+    // title like "Love/Hate" tokenizes as ["love","hate"] (matching dotted
+    // release names "Love.Hate...") instead of collapsing into "lovehate".
+    .replace(/[\.\-_:/\\\s]+/g, ' ')
+    // Accents are already folded above, so drop the À-ÿ allowance — any leftover
+    // non-ASCII letter is removed, matching the ASCII query sent to indexers.
+    .replace(/[^\w\s]/g, '')
     .toLowerCase()
     .trim();
 }
@@ -42,10 +62,7 @@ function matchesStrictSearch(title, strictPhrase) {
 
 function normaliseTitle(text) {
   if (!text) return '';
-  return text
-    .replace(/&/g, 'and')
-    .normalize('NFD')
-    .replace(/[̀-ͯ]/g, '')   // strip diacritics
+  return foldAccents(String(text).replace(/&/g, 'and'))
     .replace(/[^\p{L}\p{N}]/gu, '')   // strip ALL non-alphanumeric
     .toLowerCase();
 }
@@ -92,6 +109,7 @@ function titleSimilarityCheck(candidateParsedTitle, queryParsedTitle) {
 
 module.exports = {
   TITLE_SIMILARITY_THRESHOLD,
+  foldAccents,
   sanitizeStrictSearchPhrase,
   matchesStrictSearch,
   normaliseTitle,

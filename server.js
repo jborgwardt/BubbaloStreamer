@@ -102,7 +102,7 @@ setInterval(() => {
 
 const app = express();
 let currentPort = Number(process.env.PORT || 7000);
-const ADDON_VERSION = '1.7.12';
+const ADDON_VERSION = '1.7.13';
 const DEFAULT_ADDON_NAME = 'UsenetStreamer';
 let serverInstance = null;
 const SERVER_HOST = '0.0.0.0';
@@ -2150,6 +2150,15 @@ async function streamHandler(req, res) {
       const searchPlans = [];
       const seenPlans = new Set();
       const addPlan = (planType, { tokens = [], rawQuery = null, skipHydra = false } = {}) => {
+        // Word-boundary normalization for the text query (q=): slash/backslash in
+        // a title (e.g. "Love/Hate") aren't word boundaries to indexers, so the
+        // literal query misses dotted release names. Treat them as spaces — the
+        // single choke point for every text-plan source. (Accents are already
+        // ASCII-folded upstream by normalizeToAscii.) This also flows into the
+        // derived strictPhrase below, keeping search + matching consistent.
+        if (planType === 'search' && rawQuery) {
+          rawQuery = String(rawQuery).replace(/[/\\]+/g, ' ').replace(/\s+/g, ' ').trim() || null;
+        }
         const tokenList = [...tokens];
         if (planType === 'tvsearch') {
           if (seasonToken) tokenList.push(seasonToken);
