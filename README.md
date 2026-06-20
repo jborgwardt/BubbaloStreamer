@@ -1,4 +1,4 @@
-# UsenetStreamer
+# BubbaloStreamer
 
 <p align="center">
   <img src="https://lh3.googleusercontent.com/d/1JpEbR4EQ8ASi9UZ1i2XABPJaV1Gu60GO" alt="UsenetStreamer logo" width="180" />
