@@ -1,7 +1,7 @@
 # UsenetStreamer
 
 <p align="center">
-  <img src="assets/icon.png" alt="UsenetStreamer logo" width="180" />
+  <img src="https://drive.google.com/file/d/1JpEbR4EQ8ASi9UZ1i2XABPJaV1Gu60GO/view" alt="UsenetStreamer logo" width="180" />
 </p>
 
 <p align="center">
